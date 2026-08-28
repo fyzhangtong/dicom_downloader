@@ -40,15 +40,17 @@ from pydicom.dataset import Dataset
 # 全局状态
 # ---------------------------------------------------------------------------
 OUTPUT_ROOT = ""
-_lock = threading.Lock()
-_current_study_dir = ""          # 当前正在下载的 Study 的落地子目录
 _store_server = None            # Store SCP 服务实例
 _store_started = False
+_store_aet = ""                 # Store SCP 当前监听的 AE Title
+_store_port = 0                 # Store SCP 当前监听的端口
 _stop_event = threading.Event()
 _rate_limit_kbps = 0           # 传输限速（KB/s），0 = 不限；由批量下载开始前设置
 _rate_lock = threading.Lock()
 _rate_last_time = 0.0          # 令牌桶：上次补充令牌的时间
 _rate_tokens = 0.0             # 令牌桶：当前可用令牌（字节）
+_active_assocs = []            # 当前活跃的 DICOM association，停止时强制中断
+_assoc_lock = threading.Lock()
 
 # 线程间通信队列（工作线程 -> GUI 主线程）
 _ui_queue = queue.Queue()
@@ -73,27 +75,32 @@ def _safe_name(s):
 
 def handle_store(event):
     """处理 C-STORE：把收到的 DICOM 文件保存到对应 Study 子目录（并发安全）。"""
-    ds = event.dataset
-    ds.file_meta = event.file_meta
-    sop_uid = getattr(ds, "SOPInstanceUID", None) or ("unknown-%d" % int(time.time()))
-    study_uid = getattr(ds, "StudyInstanceUID", None)
-    if study_uid:
-        # 优先按图像自带的 StudyInstanceUID 定位目录（并发下载时不会串目录）
-        d = os.path.join(OUTPUT_ROOT, _safe_name(study_uid))
-    else:
-        with _lock:
-            d = _current_study_dir
-    if not d:
-        d = OUTPUT_ROOT
-    os.makedirs(d, exist_ok=True)
-    path = os.path.join(d, _safe_name(sop_uid) + ".dcm")
-    ds.save_as(path, enforce_file_format=True)
-    # 限速：按实际落盘文件大小节流，压低下行速率
     try:
-        _throttle(os.path.getsize(path))
-    except Exception:
-        pass
-    return 0x0000  # Success
+        ds = event.dataset
+        ds.file_meta = event.file_meta
+        sop_uid = getattr(ds, "SOPInstanceUID", None) or ("unknown-%d" % int(time.time()))
+        study_uid = getattr(ds, "StudyInstanceUID", None)
+        if study_uid:
+            # 优先按图像自带的 StudyInstanceUID 定位目录（并发下载时不会串目录）
+            d = os.path.join(OUTPUT_ROOT, _safe_name(study_uid))
+        else:
+            # 缺失 StudyInstanceUID 的异常文件统一兜底，避免并发时串到别的目录
+            d = os.path.join(OUTPUT_ROOT, "_unknown_study")
+            _ui_queue.put(("log", "[StoreSCP] 收到缺少 StudyInstanceUID 的文件，落入 _unknown_study/"))
+        if not OUTPUT_ROOT:
+            d = OUTPUT_ROOT
+        os.makedirs(d, exist_ok=True)
+        path = os.path.join(d, _safe_name(sop_uid) + ".dcm")
+        ds.save_as(path, enforce_file_format=True)
+        # 限速：按实际落盘文件大小节流，压低下行速率
+        try:
+            _throttle(os.path.getsize(path))
+        except Exception:
+            pass
+        return 0x0000  # Success
+    except Exception as e:
+        _ui_queue.put(("log", "[StoreSCP] 保存 DICOM 失败：%s" % e))
+        return 0xC000  # Unable to process，避免单文件失败中断接收
 
 
 def _throttle(size_bytes):
@@ -122,11 +129,21 @@ def _throttle(size_bytes):
 
 
 def start_store_scp(local_aet, local_port):
-    """启动本机 Store SCP（后台线程，只启动一次）。"""
-    global _store_server, _store_started
-    if _store_started:
-        _ui_queue.put(("log", "[StoreSCP] 接收服务已运行（AE=%s 端口=%d）" % (local_aet, local_port)))
-        return True
+    """启动本机 Store SCP（后台线程）。AE/端口变化时自动重启，保证与 C-Move 目标一致。"""
+    global _store_server, _store_started, _store_aet, _store_port
+    if _store_started and _store_server is not None:
+        if _store_aet == local_aet and _store_port == local_port:
+            _ui_queue.put(("log", "[StoreSCP] 接收服务已运行（AE=%s 端口=%d）" % (local_aet, local_port)))
+            return True
+        # 监听配置变化：关闭旧服务，重新启动
+        _ui_queue.put(("log", "[StoreSCP] 本地接收参数变化，正在重启（AE=%s 端口=%d）..." % (local_aet, local_port)))
+        try:
+            _store_server.shutdown()
+        except Exception as e:
+            _ui_queue.put(("log", "[StoreSCP] 关闭旧接收服务异常（忽略）：%s" % e))
+        _store_server = None
+        _store_started = False
+
     ae = AE()
     ae.add_supported_contexts(StoragePresentationContexts)
     ae.add_supported_contexts(VerificationPresentationContexts[0])
@@ -136,6 +153,8 @@ def start_store_scp(local_aet, local_port):
             ("0.0.0.0", local_port), block=False, ae_title=local_aet, evt_handlers=handlers
         )
         _store_started = True
+        _store_aet = local_aet
+        _store_port = local_port
         _ui_queue.put(("log", "[StoreSCP] 接收服务已启动：AE=%s 端口=%d" % (local_aet, local_port)))
         return True
     except Exception as e:
@@ -176,15 +195,22 @@ def test_connectivity(host, port, aet=None):
     try:
         ae = AE()
         ae.add_requested_context(Verification)
+        ae.acse_timeout = 10
+        ae.network_timeout = 10
         assoc = ae.associate(host, port, ae_title=aet)
         if assoc.is_established:
-            status = assoc.send_c_echo()
-            if status and getattr(status, "Status", None) == 0x0000:
-                echo_ok = True
-                msgs.append("DICOM C-Echo 成功：AE Title=%s 有效" % aet)
-            else:
-                msgs.append("DICOM C-Echo 未返回成功状态")
-            assoc.release()
+            try:
+                status = assoc.send_c_echo()
+                if status and getattr(status, "Status", None) == 0x0000:
+                    echo_ok = True
+                    msgs.append("DICOM C-Echo 成功：AE Title=%s 有效" % aet)
+                else:
+                    msgs.append("DICOM C-Echo 未返回成功状态")
+            finally:
+                try:
+                    assoc.release()
+                except Exception:
+                    pass
         else:
             msgs.append("DICOM 关联建立失败：请检查 AE Title=%s 是否正确" % aet)
     except Exception as e:
@@ -196,18 +222,24 @@ def test_connectivity(host, port, aet=None):
 # ---------------------------------------------------------------------------
 # 3) 读取 Excel 中的「影像号」(StudyInstanceUID) 列
 # ---------------------------------------------------------------------------
-def read_study_uids(excel_path, column, sheet_name=None):
+def read_study_uids(excel_path, column, sheet_name=None, fallback_to_first_col=True):
     """
     读取 Excel 指定列，返回去重后的非空 StudyInstanceUID 列表。
     column 可以是：
         - 列名（如 "影像号"，按表头匹配）
         - 字母（如 "A"）
         - 数字（如 "1"，1-based）
+    fallback_to_first_col=False 时，按列名匹配失败会直接抛 ValueError（不再静默读第一列）。
     """
     import openpyxl
 
     wb = openpyxl.load_workbook(excel_path, read_only=True, data_only=True)
-    ws = wb[sheet_name] if sheet_name else wb.active
+    try:
+        ws = wb[sheet_name] if sheet_name else wb.active
+    except KeyError:
+        names = "、".join(wb.sheetnames)
+        wb.close()
+        raise ValueError("Sheet「%s」不存在，当前工作簿的 Sheet 为：%s" % (sheet_name, names))
 
     rows = ws.iter_rows(values_only=True)
     header = next(rows, None)
@@ -225,7 +257,8 @@ def read_study_uids(excel_path, column, sheet_name=None):
     c = str(column).strip()
     if c.isdigit():
         col_idx = int(c) - 1
-    elif c and all(ch.isalpha() for ch in c) and len(c) <= 3:
+    elif c and c.isascii() and c.isalpha() and len(c) <= 3:
+        # 仅纯英文字母（A-Z/a-z）才按“列字母”解析，避免中文列名被误判
         col_idx = col_letter_to_idx(c)
     elif header:
         # 按表头匹配列名
@@ -234,6 +267,12 @@ def read_study_uids(excel_path, column, sheet_name=None):
                 col_idx = i
                 break
         if col_idx is None:
+            if not fallback_to_first_col:
+                headers = [str(h).strip() for h in header if h is not None and str(h).strip()]
+                raise ValueError(
+                    "在表头中找不到列「%s」。当前表头为：%s。请修改「关键列名」，或改用列字母（如 A）/序号（如 1）"
+                    % (c, "、".join(headers[:15]) if headers else "(空)")
+                )
             # 表头没匹配到，退回第一列，并把表头行也当作数据
             col_idx = 0
             start_row = 0
@@ -252,7 +291,11 @@ def read_study_uids(excel_path, column, sheet_name=None):
         val = r[col_idx] if (r and len(r) > col_idx) else None
         if val is None:
             continue
-        s = str(val).strip()
+        if isinstance(val, float) and val.is_integer():
+            # 长数字（影像号/病人ID）被 Excel 存成浮点数时，避免 str() 变成科学计数法
+            s = str(int(val))
+        else:
+            s = str(val).strip()
         if not s:
             continue
         if s not in seen:
@@ -330,10 +373,7 @@ def find_studies_by_patient(assoc, patient_id):
 
 def pull_one_study(assoc, study_uid, local_aet, out_root):
     """拉取一个 Study，影像落到 out_root/<study_uid>/ 目录。"""
-    global _current_study_dir
     subdir = os.path.join(out_root, _safe_name(study_uid))
-    with _lock:
-        _current_study_dir = subdir
     os.makedirs(subdir, exist_ok=True)
 
     ds = Dataset()
@@ -397,22 +437,63 @@ class DowloadConfig:
         self.cmove_retry_delay = 3    # C-MOVE 重试间隔（秒）
 
 
+def _register_assoc(assoc):
+    with _assoc_lock:
+        _active_assocs.append(assoc)
+
+
+def _unregister_assoc(assoc):
+    with _assoc_lock:
+        try:
+            _active_assocs.remove(assoc)
+        except ValueError:
+            pass
+
+
+def _abort_active_assocs():
+    """停止时强制中断所有活跃的 association，让卡在网络等待上的线程尽快退出。"""
+    with _assoc_lock:
+        for a in list(_active_assocs):
+            try:
+                a.abort()
+            except Exception:
+                pass
+
+
 def _make_find_assoc(cfg):
     """建立 C-Find 用的 association（按 cfind_timeout 设置超时）。"""
+    _ui_queue.put(("log", "正在连接 PACS %s:%d（C-Find，AE=%s）..." % (cfg.pacs_host, cfg.pacs_port, cfg.pacs_aet)))
     ae = AE()
     ae.add_requested_context(StudyRootQueryRetrieveInformationModelFind)
+    ae.acse_timeout = 15
     ae.dimse_timeout = int(getattr(cfg, "cfind_timeout", 60) or 60)
-    ae.network_timeout = None
-    return ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet)
+    ae.network_timeout = 30
+    try:
+        assoc = ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet)
+    except Exception as e:
+        _ui_queue.put(("log", "[C-Find] 连接 PACS 异常：%s" % e))
+        return None
+    if assoc.is_established:
+        _register_assoc(assoc)
+    return assoc
 
 
 def _make_move_assoc(cfg):
-    """建立 C-Move 用的 association（按 cmove_timeout 设置超时）。"""
+    """建立 C-Move 用的 association（按 cmove_timeout 设置超时）。连接异常返回 None。"""
+    _ui_queue.put(("log", "正在连接 PACS %s:%d（C-Move，AE=%s）..." % (cfg.pacs_host, cfg.pacs_port, cfg.pacs_aet)))
     ae = AE()
     ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+    ae.acse_timeout = 15
     ae.dimse_timeout = int(getattr(cfg, "cmove_timeout", 300) or 300)
-    ae.network_timeout = None
-    return ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet)
+    ae.network_timeout = 30
+    try:
+        assoc = ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet)
+    except Exception as e:
+        _ui_queue.put(("log", "[C-Move] 连接 PACS 异常：%s" % e))
+        return None
+    if assoc.is_established:
+        _register_assoc(assoc)
+    return assoc
 
 
 def _download_one(cfg, label, uid, idx, total):
@@ -427,12 +508,15 @@ def _download_one(cfg, label, uid, idx, total):
             _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
             return idx, False, "已停止"
         assoc = _make_move_assoc(cfg)
-        if assoc.is_established:
-            has_error, code, n_files, subdir = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT)
+        if assoc and assoc.is_established:
             try:
-                assoc.release()
-            except Exception:
-                pass
+                has_error, code, n_files, subdir = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT)
+            finally:
+                _unregister_assoc(assoc)
+                try:
+                    assoc.release()
+                except Exception:
+                    pass
             if not has_error:
                 _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
                 return idx, True, ""
@@ -450,8 +534,18 @@ def _download_one(cfg, label, uid, idx, total):
 
 
 def batch_download(cfg):
-    """批量下载主流程（在线程中运行）。"""
-    global OUTPUT_ROOT, _current_study_dir, _rate_limit_kbps
+    """批量下载主流程（在线程中运行）。任何退出路径（成功/报错/异常）都会复位 GUI 状态。"""
+    try:
+        _batch_download_inner(cfg)
+    except Exception:
+        _ui_queue.put(("error", "下载流程发生未预期异常：\n%s" % traceback.format_exc()))
+    finally:
+        _abort_active_assocs()
+        _ui_queue.put(("reset", None))
+
+
+def _batch_download_inner(cfg):
+    global OUTPUT_ROOT, _rate_limit_kbps
     global _rate_last_time, _rate_tokens
     _stop_event.clear()
 
@@ -466,9 +560,9 @@ def batch_download(cfg):
     # 1) 读 Excel（得到 keys：StudyInstanceUID 或 patientId）
     _ui_queue.put(("log", "正在读取 Excel：%s" % cfg.excel_path))
     try:
-        keys = read_study_uids(cfg.excel_path, cfg.column, cfg.sheet_name or None)
+        keys = read_study_uids(cfg.excel_path, cfg.column, cfg.sheet_name or None, fallback_to_first_col=False)
     except Exception as e:
-        _ui_queue.put(("error", "读取 Excel 失败：%s\n%s" % (e, traceback.format_exc())))
+        _ui_queue.put(("error", "读取 Excel 失败：%s" % e))
         return
     n_keys = len(keys)
     key_label = "StudyInstanceUID" if cfg.key_type == "study_uid" else "病人ID(patientId)"
@@ -487,23 +581,26 @@ def batch_download(cfg):
         cfind_timeout = int(getattr(cfg, "cfind_timeout", 60) or 60)
         _ui_queue.put(("log", "模式：按病人ID查询，先 C-Find 找出每个病人的所有检查（超时 %d 秒）..." % cfind_timeout))
         assoc_find = _make_find_assoc(cfg)
-        if not assoc_find.is_established:
+        if not assoc_find or not assoc_find.is_established:
             _ui_queue.put(("error", "连接 PACS 失败（C-Find），请检查 IP/端口/AE 及网络是否可达"))
             return
-        for pi, pid in enumerate(keys, 1):
-            if _stop_event.is_set():
-                break
-            uids = find_studies_by_patient(assoc_find, pid)
-            if not uids:
-                _ui_queue.put(("log", "  [%d/%d] patientId=%s 未查到任何检查" % (pi, n_keys, pid)))
-                continue
-            _ui_queue.put(("log", "  [%d/%d] patientId=%s -> 找到 %d 个检查" % (pi, n_keys, pid, len(uids))))
-            for u in uids:
-                tasks.append(("%s/%s" % (pid, u), u))
         try:
-            assoc_find.release()
-        except Exception:
-            pass
+            for pi, pid in enumerate(keys, 1):
+                if _stop_event.is_set():
+                    break
+                uids = find_studies_by_patient(assoc_find, pid)
+                if not uids:
+                    _ui_queue.put(("log", "  [%d/%d] patientId=%s 未查到任何检查" % (pi, n_keys, pid)))
+                    continue
+                _ui_queue.put(("log", "  [%d/%d] patientId=%s -> 找到 %d 个检查" % (pi, n_keys, pid, len(uids))))
+                for u in uids:
+                    tasks.append(("%s/%s" % (pid, u), u))
+        finally:
+            _unregister_assoc(assoc_find)
+            try:
+                assoc_find.release()
+            except Exception:
+                pass
     else:
         for u in keys:
             tasks.append((str(u), u))
@@ -566,13 +663,17 @@ def batch_download(cfg):
                     done += 1
                     if is_ok:
                         ok += 1
+                    elif msg == "已停止":
+                        pass  # 手动停止的未开始任务不计入失败
                     else:
                         fail += 1
                 _ui_queue.put(("progress", (done, total)))
                 _ui_queue.put(("log", "[汇总] %d/%d（成功 %d / 失败 %d）" % (done, total, ok, fail)))
 
-    summary = "下载完成：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)
-    _ui_queue.put(("done", summary))
+    if _stop_event.is_set():
+        _ui_queue.put(("done", "已停止：成功 %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, fail, total)))
+    else:
+        _ui_queue.put(("done", "下载完成：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
 
 
 # ---------------------------------------------------------------------------
@@ -725,10 +826,16 @@ class App:
     def _collect_cfg(self):
         c = DowloadConfig()
         c.pacs_host = self.var_pacs_host.get().strip()
-        c.pacs_port = int(self.var_pacs_port.get().strip() or 104)
+        try:
+            c.pacs_port = int(self.var_pacs_port.get().strip() or 104)
+        except ValueError:
+            c.pacs_port = 104
         c.pacs_aet = self.var_pacs_aet.get().strip()
         c.local_aet = self.var_local_aet.get().strip() or "MYAET"
-        c.local_port = int(self.var_local_port.get().strip() or 11112)
+        try:
+            c.local_port = int(self.var_local_port.get().strip() or 11112)
+        except ValueError:
+            c.local_port = 11112
         c.excel_path = self.var_excel.get().strip()
         c.sheet_name = self.var_sheet.get().strip()
         c.column = self.var_column.get().strip() or "影像号"
@@ -795,6 +902,12 @@ class App:
         if self.thread and self.thread.is_alive():
             messagebox.showinfo("提示", "已有下载任务在运行中")
             return
+        try:
+            int(self.var_pacs_port.get().strip() or 104)
+            int(self.var_local_port.get().strip() or 11112)
+        except ValueError:
+            messagebox.showwarning("提示", "PACS端口和本机接收端口必须是数字")
+            return
         cfg = self._collect_cfg()
         if not cfg.pacs_host or not cfg.pacs_aet:
             messagebox.showwarning("提示", "请填写 PACS IP 和 AE Title")
@@ -818,7 +931,8 @@ class App:
 
     def _stop(self):
         _stop_event.set()
-        self._append_log("正在停止（当前 Study 完成后生效）...")
+        _abort_active_assocs()
+        self._append_log("正在停止（中断当前连接，稍候即生效）...")
 
     def _save_config(self):
         cfg = self._collect_cfg()
@@ -874,39 +988,55 @@ class App:
         self.log.delete("1.0", "end")
         self.log.config(state="disabled")
 
+    def _reset_ui(self, status_text=None):
+        """复位按钮/状态（下载线程结束或出错时调用），保证界面不会卡死。"""
+        self.btn_start.config(state="normal")
+        self.btn_stop.config(state="disabled")
+        if status_text:
+            self.var_status.set(status_text)
+
     def _poll_queue(self):
         try:
             while True:
                 kind, payload = _ui_queue.get_nowait()
-                if kind == "log":
-                    self._append_log(payload)
-                elif kind == "error":
-                    self._append_log("[错误] " + payload)
-                    messagebox.showerror("错误", payload[:500])
-                elif kind == "conn_result":
-                    ok, msgs = payload
-                    for m in msgs:
-                        self._append_log(m)
-                    self.btn_test.config(state="normal")
-                    if ok:
-                        messagebox.showinfo("检测结果", "\n".join(msgs))
-                    else:
-                        messagebox.showwarning("检测结果", "\n".join(msgs))
-                elif kind == "progress":
-                    done, total = payload
-                    if total > 0:
-                        self.progress["value"] = done * 100.0 / total
-                        self.var_status.set("进度 %d / %d" % (done, total))
-                elif kind == "status":
-                    self.var_status.set(payload)
-                elif kind == "done":
-                    self._append_log(payload)
-                    self.var_status.set(payload)
-                    self.btn_start.config(state="normal")
-                    self.btn_stop.config(state="disabled")
-                    messagebox.showinfo("完成", payload)
+                try:
+                    if kind == "log":
+                        self._append_log(payload)
+                    elif kind == "error":
+                        self._append_log("[错误] " + payload)
+                        self._reset_ui("出错，已停止（可修改配置后重新开始）")
+                        messagebox.showerror("错误", payload[:500])
+                    elif kind == "conn_result":
+                        ok, msgs = payload
+                        for m in msgs:
+                            self._append_log(m)
+                        self.btn_test.config(state="normal")
+                        if ok:
+                            messagebox.showinfo("检测结果", "\n".join(msgs))
+                        else:
+                            messagebox.showwarning("检测结果", "\n".join(msgs))
+                    elif kind == "progress":
+                        done, total = payload
+                        if total > 0:
+                            self.progress["value"] = done * 100.0 / total
+                            self.var_status.set("进度 %d / %d" % (done, total))
+                    elif kind == "status":
+                        self.var_status.set(payload)
+                    elif kind == "done":
+                        self._append_log(payload)
+                        self.var_status.set(payload)
+                        self._reset_ui()
+                        messagebox.showinfo("完成", payload)
+                    elif kind == "reset":
+                        # 下载线程任何退出路径都会发送，兜底复位界面
+                        self._reset_ui()
+                except Exception:
+                    # 单条消息处理失败不影响后续轮询
+                    traceback.print_exc()
         except queue.Empty:
             pass
+        except Exception:
+            traceback.print_exc()
         self.root.after(200, self._poll_queue)
 
 
