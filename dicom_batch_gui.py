@@ -13,6 +13,7 @@ DICOM 影像批量下载工具（可视化版）
 运行环境：Windows（打包为 exe 后双击运行即可，无需安装 Python）
 """
 
+import csv
 import json
 import os
 import queue
@@ -27,7 +28,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from pynetdicom import AE, evt
-from pynetdicom.presentation import StoragePresentationContexts, VerificationPresentationContexts
+from pynetdicom.presentation import StoragePresentationContexts
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
     StudyRootQueryRetrieveInformationModelMove,
@@ -51,6 +52,10 @@ _rate_last_time = 0.0          # 令牌桶：上次补充令牌的时间
 _rate_tokens = 0.0             # 令牌桶：当前可用令牌（字节）
 _active_assocs = []            # 当前活跃的 DICOM association，停止时强制中断
 _assoc_lock = threading.Lock()
+
+# 下载结果记录（每次下载一条，最终写入 CSV 报告并在 GUI 历史列表展示）
+_download_records = []
+_records_lock = threading.Lock()
 
 # 线程间通信队列（工作线程 -> GUI 主线程）
 _ui_queue = queue.Queue()
@@ -146,7 +151,7 @@ def start_store_scp(local_aet, local_port):
 
     ae = AE()
     ae.add_supported_contexts(StoragePresentationContexts)
-    ae.add_supported_contexts(VerificationPresentationContexts[0])
+    ae.add_requested_context(Verification)
     handlers = [(evt.EVT_C_STORE, handle_store)]
     try:
         _store_server = ae.start_server(
@@ -496,17 +501,145 @@ def _make_move_assoc(cfg):
     return assoc
 
 
-def _download_one(cfg, label, uid, idx, total):
-    """下载单个 Study（失败/超时后自动重试）。返回 (idx, ok, fail_msg)。"""
+def _record_download(idx, key, uid, label, status, n_files, message=""):
+    """追加一条下载结果记录（线程安全）。"""
+    rec = {
+        "idx": idx,
+        "key": key,
+        "study_uid": uid,
+        "label": label,
+        "status": status,
+        "n_files": n_files,
+        "message": message,
+        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    with _records_lock:
+        _download_records.append(rec)
+
+
+def _clear_records():
+    with _records_lock:
+        _download_records.clear()
+
+
+def _snapshot_records():
+    with _records_lock:
+        return list(_download_records)
+
+
+_MANIFEST_LOCK = threading.Lock()
+
+
+def _manifest_path():
+    """成功清单文件路径（与下载输出同目录）。"""
+    if not OUTPUT_ROOT:
+        return None
+    return os.path.join(OUTPUT_ROOT, "成功清单.csv")
+
+
+def _load_manifest_uids():
+    """读取成功清单，返回 set。文件不存在或异常时返回空集。"""
+    p = _manifest_path()
+    if not p or not os.path.isfile(p):
+        return set()
+    s = set()
+    try:
+        with open(p, "r", encoding="utf-8-sig", newline="") as f:
+            r = csv.reader(f)
+            for row in r:
+                if not row:
+                    continue
+                cell = row[0].strip()
+                if cell and cell.lower() != "studyinstanceuid":
+                    s.add(cell)
+    except Exception as e:
+        _ui_queue.put(("log", "[清单] 读取成功清单失败：%s" % e))
+    return s
+
+
+def _append_manifest_uid(uid):
+    """下载成功后追加一条 UID 到成功清单。"""
+    p = _manifest_path()
+    if not p:
+        return
+    try:
+        with _MANIFEST_LOCK:
+            os.makedirs(OUTPUT_ROOT, exist_ok=True)
+            new_file = not os.path.isfile(p)
+            with open(p, "a", encoding="utf-8-sig", newline="") as f:
+                w = csv.writer(f)
+                if new_file:
+                    w.writerow(["StudyInstanceUID"])
+                w.writerow([uid])
+    except Exception as e:
+        _ui_queue.put(("log", "[清单] 写入成功清单失败：%s" % e))
+
+
+def _already_downloaded(uid, manifest_set):
+    """断点续传判断：以“成功清单”为准，清单里有的视为已成功。"""
+    if uid in manifest_set:
+        # 顺便统计本地落盘数（仅供日志显示，不影响跳过判断）
+        d = os.path.join(OUTPUT_ROOT, _safe_name(uid))
+        n = 0
+        if os.path.isdir(d):
+            try:
+                n = len([f for f in os.listdir(d) if f.endswith(".dcm")])
+            except Exception:
+                n = 0
+        return True, n
+    return False, 0
+
+
+_REPORT_HEADER = ["序号", "查询键", "StudyInstanceUID", "结果", "文件数", "说明", "时间"]
+
+
+def _write_report_csv(records, out_root):
+    """把下载记录写入输出目录下的 CSV 报告，返回文件路径；失败返回 None。"""
+    if not out_root:
+        return None
+    try:
+        os.makedirs(out_root, exist_ok=True)
+    except Exception:
+        return None
+    csv_path = os.path.join(out_root, "下载报告_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(_REPORT_HEADER)
+            for r in records:
+                w.writerow([r["idx"], r["key"], r["study_uid"], r["status"],
+                            r["n_files"], r["message"], r["time"]])
+        return csv_path
+    except Exception as e:
+        _ui_queue.put(("log", "[报告] 写入下载报告失败：%s" % e))
+        return None
+
+
+def _download_one(cfg, key, label, uid, idx, total, manifest_set):
+    """下载单个 Study（失败/超时自动重试，已存在则跳过）。返回 (idx, status, n_files, message)。"""
     retry = int(getattr(cfg, "cmove_retry", 1) or 1)
     delay = int(getattr(cfg, "cmove_retry_delay", 3) or 3)
     fail_msg = ""
     n_files = 0
-    subdir = ""
+
+    # 停止优先于断点续传：停止后剩余任务统一记为“停止”
+    if _stop_event.is_set():
+        _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
+        _record_download(idx, key, uid, label, "停止", 0)
+        return idx, "stopped", 0, "已停止"
+
+    # 断点续传：成功清单里有该 UID 则跳过（精准判断，不受半成品影响）
+    exists, n_exist = _already_downloaded(uid, manifest_set)
+    if exists:
+        _ui_queue.put(("log", "[%d/%d] [跳过] %s（成功清单已存在，本地 %d 个文件，不重复下载）" % (idx, total, label, n_exist)))
+        _record_download(idx, key, uid, label, "已存在(跳过)", n_exist)
+        return idx, "skipped", n_exist, ""
+
     for attempt in range(retry + 1):
         if _stop_event.is_set():
             _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
-            return idx, False, "已停止"
+            _record_download(idx, key, uid, label, "停止", 0)
+            return idx, "stopped", 0, "已停止"
         assoc = _make_move_assoc(cfg)
         if assoc and assoc.is_established:
             try:
@@ -519,8 +652,11 @@ def _download_one(cfg, label, uid, idx, total):
                     pass
             if not has_error:
                 _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
-                return idx, True, ""
-            fail_msg = "状态码 0x%04X" % code
+                _append_manifest_uid(uid)  # 仅成功才写清单
+                manifest_set.add(uid)
+                _record_download(idx, key, uid, label, "成功", n_files)
+                return idx, "success", n_files, ""
+            fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
         else:
             fail_msg = "连接 PACS 失败"
         if attempt < retry:
@@ -529,18 +665,22 @@ def _download_one(cfg, label, uid, idx, total):
             t_end = time.time() + delay
             while time.time() < t_end and not _stop_event.is_set():
                 time.sleep(0.5)
-    _ui_queue.put(("log", "[%d/%d] [失败] %s：%s（本地文件 %d 个）" % (idx, total, label, fail_msg, n_files)))
-    return idx, False, fail_msg
+    _ui_queue.put(("log", "[%d/%d] [失败] %s：%s" % (idx, total, label, fail_msg)))
+    _record_download(idx, key, uid, label, "失败", n_files, fail_msg)
+    return idx, "failed", n_files, fail_msg
 
 
 def batch_download(cfg):
-    """批量下载主流程（在线程中运行）。任何退出路径（成功/报错/异常）都会复位 GUI 状态。"""
+    """批量下载主流程（在线程中运行）。任何退出路径（成功/报错/异常）都会复位 GUI 状态并写报告。"""
     try:
         _batch_download_inner(cfg)
     except Exception:
         _ui_queue.put(("error", "下载流程发生未预期异常：\n%s" % traceback.format_exc()))
     finally:
         _abort_active_assocs()
+        records = _snapshot_records()
+        csv_path = _write_report_csv(records, cfg.out_dir) if records else None
+        _ui_queue.put(("report", (records, csv_path)))
         _ui_queue.put(("reset", None))
 
 
@@ -548,6 +688,7 @@ def _batch_download_inner(cfg):
     global OUTPUT_ROOT, _rate_limit_kbps
     global _rate_last_time, _rate_tokens
     _stop_event.clear()
+    _clear_records()
 
     OUTPUT_ROOT = cfg.out_dir
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
@@ -594,7 +735,7 @@ def _batch_download_inner(cfg):
                     continue
                 _ui_queue.put(("log", "  [%d/%d] patientId=%s -> 找到 %d 个检查" % (pi, n_keys, pid, len(uids))))
                 for u in uids:
-                    tasks.append(("%s/%s" % (pid, u), u))
+                    tasks.append((str(pid), "%s/%s" % (pid, u), u))
         finally:
             _unregister_assoc(assoc_find)
             try:
@@ -603,7 +744,7 @@ def _batch_download_inner(cfg):
                 pass
     else:
         for u in keys:
-            tasks.append((str(u), u))
+            tasks.append((str(u), str(u), u))
 
     total = len(tasks)
     _ui_queue.put(("log", "共需下载 %d 个检查（Study）" % total))
@@ -619,23 +760,31 @@ def _batch_download_inner(cfg):
     cmove_retry = int(getattr(cfg, "cmove_retry", 1) or 1)
     _ui_queue.put(("log", "开始下载：并发数=%d，C-Move 超时=%d 秒，重试=%d 次" % (concurrent, cmove_timeout, cmove_retry)))
 
+    # 加载成功清单（精准断点续传依据）
+    manifest_set = _load_manifest_uids()
+    if manifest_set:
+        _ui_queue.put(("log", "成功清单已加载：%d 个 UID 标记为已下载，将自动跳过" % len(manifest_set)))
+
     ok = 0
+    skip = 0
     fail = 0
 
     if concurrent == 1:
         # 串行（支持间隙暂停）
         pause_every = int(getattr(cfg, "pause_every", 0) or 0)
         pause_seconds = int(getattr(cfg, "pause_seconds", 0) or 0)
-        for i, (label, uid) in enumerate(tasks, 1):
+        for i, (key, label, uid) in enumerate(tasks, 1):
             if _stop_event.is_set():
                 _ui_queue.put(("log", "已手动停止，剩余 %d 个未处理" % (total - i + 1)))
                 break
             _ui_queue.put(("progress", (i, total)))
             _ui_queue.put(("log", "[%d/%d] 拉取 %s" % (i, total, label)))
-            _idx, is_ok, msg = _download_one(cfg, label, uid, i, total)
-            if is_ok:
+            _idx, status, n_files, msg = _download_one(cfg, key, label, uid, i, total, manifest_set)
+            if status == "success":
                 ok += 1
-            elif msg == "已停止":
+            elif status == "skipped":
+                skip += 1
+            elif status == "stopped":
                 break
             else:
                 fail += 1
@@ -656,24 +805,28 @@ def _batch_download_inner(cfg):
         lock = threading.Lock()
         done = 0
         with ThreadPoolExecutor(max_workers=concurrent) as pool:
-            futures = [pool.submit(_download_one, cfg, label, uid, i, total) for i, (label, uid) in enumerate(tasks, 1)]
+            futures = [pool.submit(_download_one, cfg, key, label, uid, i, total, manifest_set)
+                       for i, (key, label, uid) in enumerate(tasks, 1)]
             for fut in as_completed(futures):
-                _idx, is_ok, msg = fut.result()
+                _idx, status, n_files, msg = fut.result()
                 with lock:
                     done += 1
-                    if is_ok:
+                    if status == "success":
                         ok += 1
-                    elif msg == "已停止":
+                    elif status == "skipped":
+                        skip += 1
+                    elif status == "stopped":
                         pass  # 手动停止的未开始任务不计入失败
                     else:
                         fail += 1
                 _ui_queue.put(("progress", (done, total)))
-                _ui_queue.put(("log", "[汇总] %d/%d（成功 %d / 失败 %d）" % (done, total, ok, fail)))
+                _ui_queue.put(("log", "[汇总] %d/%d（成功 %d / 跳过 %d / 失败 %d）" % (done, total, ok, skip, fail)))
 
     if _stop_event.is_set():
-        _ui_queue.put(("done", "已停止：成功 %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, fail, total)))
+        _ui_queue.put(("done", "已停止：成功 %d / 跳过(已存在) %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, skip, fail, total)))
+        _ui_queue.put(("log", "已停止：成功 %d / 跳过 %d / 失败 %d / 共 %d" % (ok, skip, fail, total)))
     else:
-        _ui_queue.put(("done", "下载完成：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
+        _ui_queue.put(("done", "下载完成：成功 %d / 跳过(已存在) %d / 失败 %d / 共 %d" % (ok, skip, fail, total)))
 
 
 # ---------------------------------------------------------------------------
@@ -688,6 +841,8 @@ class App:
 
         self.cfg = DowloadConfig()
         self.thread = None
+        self.records = []       # 最近一次下载的结果记录
+        self.report_csv = None  # 最近一次下载报告 CSV 路径
 
         self._build_widgets()
         self._load_config()
@@ -791,6 +946,8 @@ class App:
         self.btn_stop.pack(side="left", padx=4)
         ttk.Button(fbtn, text="保存配置", command=self._save_config).pack(side="left", padx=4)
         ttk.Button(fbtn, text="加载配置", command=self._load_config).pack(side="left", padx=4)
+        self.btn_history = ttk.Button(fbtn, text="下载记录", command=self._show_history, state="disabled")
+        self.btn_history.pack(side="left", padx=4)
 
         # 进度条
         self.progress = ttk.Progressbar(self.root, mode="determinate")
@@ -995,6 +1152,68 @@ class App:
         if status_text:
             self.var_status.set(status_text)
 
+    def _show_history(self):
+        """弹出下载记录列表窗口。"""
+        if not self.records:
+            messagebox.showinfo("提示", "暂无下载记录，请先执行一次下载")
+            return
+        win = tk.Toplevel(self.root)
+        win.title("下载记录")
+        win.geometry("1060x520")
+        win.transient(self.root)
+
+        cols = ("idx", "key", "uid", "status", "n_files", "message", "time")
+        headers = ("序号", "查询键", "StudyInstanceUID", "结果", "文件数", "说明", "时间")
+        widths = (60, 150, 240, 100, 70, 260, 150)
+
+        main = ttk.Frame(win)
+        main.pack(fill="both", expand=True, padx=8, pady=8)
+        tree = ttk.Treeview(main, columns=cols, show="headings")
+        for c, h, w in zip(cols, headers, widths):
+            tree.heading(c, text=h)
+            tree.column(c, width=w, anchor="w")
+        for r in self.records:
+            tree.insert("", "end", values=(
+                r["idx"], r["key"], r["study_uid"], r["status"],
+                r["n_files"], r["message"], r["time"],
+            ))
+
+        vsb = ttk.Scrollbar(main, orient="vertical", command=tree.yview)
+        hsb = ttk.Scrollbar(main, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        tree.grid(row=0, column=0, sticky="nsew")
+        vsb.grid(row=0, column=1, sticky="ns")
+        hsb.grid(row=1, column=0, sticky="ew")
+        main.rowconfigure(0, weight=1)
+        main.columnconfigure(0, weight=1)
+
+        bar = ttk.Frame(win)
+        bar.pack(fill="x", padx=8, pady=(0, 8))
+        ttk.Button(bar, text="导出 CSV", command=lambda: self._export_history(win)).pack(side="left", padx=4)
+        ttk.Button(bar, text="关闭", command=win.destroy).pack(side="left", padx=4)
+
+    def _export_history(self, parent=None):
+        """把当前下载记录导出为用户指定位置的 CSV。"""
+        if not self.records:
+            return
+        p = filedialog.asksaveasfilename(
+            parent=parent, title="导出下载记录",
+            defaultextension=".csv", initialfile="下载记录.csv",
+            filetypes=[("CSV 文件", "*.csv"), ("所有文件", "*.*")],
+        )
+        if not p:
+            return
+        try:
+            with open(p, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(_REPORT_HEADER)
+                for r in self.records:
+                    w.writerow([r["idx"], r["key"], r["study_uid"], r["status"],
+                                r["n_files"], r["message"], r["time"]])
+            messagebox.showinfo("提示", "已导出：%s" % p)
+        except Exception as e:
+            messagebox.showerror("错误", "导出失败：%s" % e)
+
     def _poll_queue(self):
         try:
             while True:
@@ -1027,6 +1246,13 @@ class App:
                         self.var_status.set(payload)
                         self._reset_ui()
                         messagebox.showinfo("完成", payload)
+                    elif kind == "report":
+                        records, csv_path = payload
+                        self.records = records or []
+                        self.report_csv = csv_path
+                        self.btn_history.config(state="normal" if self.records else "disabled")
+                        if csv_path:
+                            self._append_log("[报告] 下载报告已保存：%s" % csv_path)
                     elif kind == "reset":
                         # 下载线程任何退出路径都会发送，兜底复位界面
                         self._reset_ui()
