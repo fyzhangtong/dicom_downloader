@@ -146,6 +146,32 @@ def _throttle(size_bytes):
         time.sleep(min(need, 5.0))
 
 
+def _try_bind_port(port):
+    """尝试绑定本机端口（绑定后立即释放），用于检测端口是否可用。返回 (ok, err)。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind(("0.0.0.0", port))
+        return True, ""
+    except OSError as e:
+        return False, str(e)
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def _port_bind_hint(port):
+    """本机端口无法绑定时的可操作建议。"""
+    return ("端口 %d 无法绑定的可能原因：\n"
+            "1) 本工具的其它实例或其它程序正占用该端口，请关闭后重试；\n"
+            "2) 端口落在 Windows Hyper-V/WSL 保留的排除范围内，可在 cmd 运行 "
+            "netsh interface ipv4 show excludedportrange protocol=tcp 查看，"
+            "改用一个不在范围内的端口（需重新向医院前置机注册）或重启电脑后重试；\n"
+            "3) 被杀毒软件/防火墙拦截，请将本程序加入白名单。" % port)
+
+
 def start_store_scp(local_aet, local_port):
     """启动本机 Store SCP（后台线程）。AE/端口变化时自动重启，保证与 C-Move 目标一致。"""
     global _store_server, _store_started, _store_aet, _store_port
@@ -187,7 +213,7 @@ def start_store_scp(local_aet, local_port):
                 ("0.0.0.0", local_port), False, handlers, local_aet,
             )
     except Exception as e:
-        _ui_queue.put(("error", "Store SCP 启动失败：%s" % e))
+        _ui_queue.put(("error", "Store SCP 启动失败：%s\n%s" % (e, _port_bind_hint(local_port))))
         return False
     # 成功启动后统一更新状态（之前在 3.x 路径下会漏设置 _store_started）
     _store_started = True
@@ -200,16 +226,29 @@ def start_store_scp(local_aet, local_port):
 # ---------------------------------------------------------------------------
 # 2) 网络可达性检测
 # ---------------------------------------------------------------------------
-def test_connectivity(host, port, aet=None):
+def test_connectivity(host, port, aet=None, local_port=None):
     """
     检测 PACS 前置机可达性。
     返回 (ok, messages)：
         1. TCP 端口连通性检查（判断网络/端口是否可达）
         2. DICOM C-Echo 检查（判断 DICOM 服务与 AE Title 是否有效，需要提供 aet）
+        3. 本机接收端口自检（判断下载时能否绑定本地端口，需要提供 local_port）
     """
     msgs = []
     tcp_ok = False
     echo_ok = False
+    local_ok = True
+
+    # 0) 本机接收端口自检（与 PACS 无关，先查，避免"测试成功但下载绑定失败"）
+    # 注意：本工具的 Store SCP 若已在监听该端口，属于正常占用，跳过自检
+    if local_port and not (_store_started and _store_port == local_port):
+        ok, err = _try_bind_port(local_port)
+        if ok:
+            msgs.append("本机接收端口自检：端口 %d 可正常绑定" % local_port)
+        else:
+            local_ok = False
+            msgs.append("本机接收端口自检失败：端口 %d 无法绑定（%s）" % (local_port, err))
+            msgs.append(_port_bind_hint(local_port))
 
     # 1) TCP 连通性
     try:
@@ -225,7 +264,7 @@ def test_connectivity(host, port, aet=None):
     # 2) DICOM C-Echo（验证 AE Title 与 DICOM 服务）
     if not aet:
         msgs.append("未填写 AE Title，跳过 DICOM C-Echo 验证")
-        return tcp_ok, msgs
+        return (tcp_ok and local_ok), msgs
 
     try:
         ae = AE()
@@ -256,7 +295,7 @@ def test_connectivity(host, port, aet=None):
     except Exception as e:
         msgs.append("DICOM C-Echo 异常：%s" % e)
 
-    return (tcp_ok and (echo_ok if aet else True)), msgs
+    return (tcp_ok and local_ok and (echo_ok if aet else True)), msgs
 
 
 # ---------------------------------------------------------------------------
@@ -1059,12 +1098,16 @@ class App:
             messagebox.showwarning("提示", "PACS 端口必须是数字")
             return
         aet = self.var_pacs_aet.get().strip() or None
+        try:
+            local_port = int(self.var_local_port.get().strip() or 11112)
+        except ValueError:
+            local_port = None
 
-        self._append_log("正在检测 %s:%d 连通性 ..." % (host, port))
+        self._append_log("正在检测 %s:%d 连通性（含本机接收端口自检）..." % (host, port))
         self.btn_test.config(state="disabled")
 
         def worker():
-            ok, msgs = test_connectivity(host, port, aet)
+            ok, msgs = test_connectivity(host, port, aet, local_port=local_port)
             _ui_queue.put(("conn_result", (ok, msgs)))
 
         threading.Thread(target=worker, daemon=True).start()
