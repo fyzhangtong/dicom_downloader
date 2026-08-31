@@ -57,6 +57,10 @@ _rate_tokens = 0.0             # 令牌桶：当前可用令牌（字节）
 _active_assocs = []            # 当前活跃的 DICOM association，停止时强制中断
 _assoc_lock = threading.Lock()
 _current_key_type = "patient_id"  # 当前下载模式：patient_id(按病人ID) / study_uid(按StudyUID)，Store SCP 据此决定落盘目录名
+# 当前正在下载的检查信息（供 handle_store 通知 GUI 进度用）
+_current_label = ""
+_current_expected_images = 0   # 前置机报告的预期影像数（用于显示"X / N"）
+_download_start_time = 0.0     # 本次批量下载的开始时间戳（用于"已耗时"）
 
 # 下载结果记录（每次下载一条，最终写入 CSV 报告并在 GUI 历史列表展示）
 _download_records = []
@@ -154,6 +158,12 @@ def handle_store(event):
             _throttle(os.path.getsize(path))
         except Exception:
             pass
+        # 通知 GUI：当前检查已收到一个影像
+        try:
+            n_in_dir = _count_dcm(d)
+            _ui_queue.put(("image_progress", (_current_label, n_in_dir, _current_expected_images)))
+        except Exception:
+            pass
         return 0x0000  # Success
     except Exception as e:
         _ui_queue.put(("log", "[StoreSCP] 保存 DICOM 失败：%s" % e))
@@ -232,31 +242,22 @@ def start_store_scp(local_aet, local_port):
     ae = AE()
     # 优先用更全的存储上下文（含压缩格式），减少前置机因"格式不被接收"而子操作失败
     storage_ctxs = _ALL_STORAGE_CTX or StoragePresentationContexts
-    # StoragePresentationContexts 是列表，需要逐个 add_supported_context（pynetdicom 3.x 没有复数 API）
+    # StoragePresentationContexts 是列表，需要逐个 add_supported_context
     for ctx in storage_ctxs:
         ae.add_supported_context(ctx.abstract_syntax, ctx.transfer_syntax)
     ae.add_requested_context(Verification)
     handlers = [(evt.EVT_C_STORE, handle_store), (evt.EVT_CONN_OPEN, _on_conn_open)]
-    # 优先用属性设置 AE Title（所有 pynetdicom 版本通用，2.x 之前 start_server 不支持 ae_title 关键字）
     try:
         ae.ae_title = local_aet
     except Exception:
         pass
     try:
-        # 跨 2.x/3.x 兼容：先 try 关键字参数，失败回落位置参数
-        try:
-            _store_server = ae.start_server(
-                ("0.0.0.0", local_port), block=False, evt_handlers=handlers, ae_title=local_aet,
-            )
-        except TypeError:
-            # 2.x 早期：ae_title / evt_handlers 是位置参数
-            _store_server = ae.start_server(
-                ("0.0.0.0", local_port), False, handlers, local_aet,
-            )
+        _store_server = ae.start_server(
+            ("0.0.0.0", local_port), block=False, evt_handlers=handlers, ae_title=local_aet,
+        )
     except Exception as e:
         _ui_queue.put(("error", "Store SCP 启动失败：%s\n%s" % (e, _port_bind_hint(local_port))))
         return False
-    # 成功启动后统一更新状态（之前在 3.x 路径下会漏设置 _store_started）
     _store_started = True
     _store_aet = local_aet
     _store_port = local_port
@@ -471,7 +472,7 @@ def find_studies_by_patient(assoc, patient_id):
     seen_uids = set()  # 去重 set，避免 O(n²) 遍历
     last_status = None
     try:
-        # 注意：pynetdicom 2.x/3.x 签名兼容写法 - query_model 位置参数（3.x 不支持 query_model= 关键字）
+        # send_c_find(dataset, query_model) - query_model 必须位置参数
         for status, identifier in assoc.send_c_find(ds, StudyRootQueryRetrieveInformationModelFind):
             if status:
                 last_status = status.Status
@@ -514,7 +515,7 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
     n_failed = 0    # 子操作失败数（前置机推送失败的影像数）
     n_warned = 0    # 子操作警告数
     try:
-        # 3.x 签名：send_c_move(dataset, move_aet, query_model) - query_model 必须位置参数
+        # send_c_move(dataset, move_aet, query_model) - query_model 必须位置参数
         for status, _ in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
             if status:
                 code = status.Status
@@ -534,7 +535,7 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
                 if code not in _PENDING:
                     final_code = code
                     # 0xB000=警告:子操作完成但有失败，属于“部分成功”，不当作硬错误；
-                    # 交由 _download_one 依据 n_failed/n_warned 走增量补拉，避免整 Study 全量重拉
+                    # 由 _download_one 按本地实际落盘文件数记为成功，接受个别失败
                     if code not in (0x0000, 0xB000):
                         has_error = True
     except Exception as e:
@@ -554,89 +555,9 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
             if n_files > 0:
                 break
     _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件" % (final_code, _status_text(final_code), n_files)))
-    return has_error, final_code, n_files, subdir, n_failed, n_warned
-
-
-def find_missing_sop_uids(cfg, study_uid, subdir):
-    """IMAGE 级 C-Find 列出该 Study 应有的全部 SOPInstanceUID，与本地已落盘文件对比，
-    返回缺失的 UID 列表。查询失败/无结果时返回 None（表示无法增量核对，需整 Study 重拉）。"""
-    assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelFind, "C-Find", "cfind_timeout", 60)
-    if not (assoc and assoc.is_established):
-        return None
-    try:
-        ds = Dataset()
-        ds.QueryRetrieveLevel = "IMAGE"
-        ds.StudyInstanceUID = study_uid
-        ds.SOPInstanceUID = ""
-        expected = []
-        seen = set()
-        try:
-            for status, identifier in assoc.send_c_find(ds, StudyRootQueryRetrieveInformationModelFind):
-                if identifier:
-                    suid = getattr(identifier, "SOPInstanceUID", None)
-                    if suid:
-                        s = str(suid)
-                        if s not in seen:
-                            seen.add(s)
-                            expected.append(s)
-        except Exception as e:
-            _ui_queue.put(("log", "      [增量核对] IMAGE 级 C-Find 异常：%s" % e))
-            return None
-        if not expected:
-            # 前置机可能不支持 IMAGE 级查询
-            return None
-        local = set()
-        try:
-            for f in os.listdir(subdir):
-                if f.endswith(".dcm"):
-                    local.add(f[:-4])  # 文件名即 _safe_name(SOPInstanceUID)
-        except Exception:
-            pass
-        missing = [u for u in expected if _safe_name(u) not in local]
-        _ui_queue.put(("log", "      [增量核对] 前置机应有 %d 个影像，本地已有 %d 个，缺失 %d 个" % (
-            len(expected), len(local), len(missing))))
-        return missing
-    finally:
-        _unregister_assoc(assoc)
-        try:
-            assoc.release()
-        except Exception:
-            pass
-
-
-def pull_images(cfg, study_uid, sop_uids, local_aet):
-    """IMAGE 级 C-Move 只补拉指定影像。返回 (has_error, final_code)。"""
-    assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
-    if not (assoc and assoc.is_established):
-        return True, 0xA700
-    try:
-        ds = Dataset()
-        ds.QueryRetrieveLevel = "IMAGE"
-        ds.StudyInstanceUID = study_uid
-        ds.SOPInstanceUID = sop_uids
-        final_code = 0x0000
-        has_error = False
-        try:
-            for status, _ in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
-                if status:
-                    code = status.Status
-                    if code not in _PENDING:
-                        _ui_queue.put(("log", "      [补拉] 响应状态 0x%04X %s" % (code, _status_text(code))))
-                        final_code = code
-                        # 0xB000 同样视为“部分成功”，回到调用处做二次增量核对，
-                        # 而不是直接判定失败进入重试
-                        if code not in (0x0000, 0xB000):
-                            has_error = True
-        except Exception as e:
-            has_error = True
-            _ui_queue.put(("log", "      [补拉 异常] %s" % e))
-        return has_error, final_code
-    finally:
-        _unregister_assoc(assoc)
-        try:
-            assoc.release()
-        except Exception:
-            pass
+    # n_total = 已收到 + 已失败 + 已警告 = 前置机本应推送的影像总数（用于 GUI 显示 "X / N"）
+    n_total = n_files + n_failed + n_warned
+    return has_error, final_code, n_files, subdir, n_failed, n_warned, n_total
 
 
 # ---------------------------------------------------------------------------
@@ -827,6 +748,9 @@ def _write_report_csv(records, out_root):
 
 def _download_one(cfg, key, label, uid, idx, total, manifest_set):
     """下载单个 Study（失败/超时自动重试，已存在则跳过）。返回 (idx, status, n_files, message)。"""
+    global _current_label, _current_expected_images
+    _current_label = label
+    _current_expected_images = 0  # 拉取前未知，由 pull_one_study 返回值/异常时回填
     retry = int(getattr(cfg, "cmove_retry", 1) or 1)
     delay = int(getattr(cfg, "cmove_retry_delay", 3) or 3)
     fail_msg = ""
@@ -843,6 +767,8 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
     if exists:
         _ui_queue.put(("log", "[%d/%d] [跳过] %s（成功清单已存在，本地 %d 个文件，不重复下载）" % (idx, total, label, n_exist)))
         _record_download(idx, key, uid, label, "已存在(跳过)", n_exist)
+        # 同步 UI 进度条：当前检查"已完整"，预期数标记为已有数（N==n 视为完成）
+        _ui_queue.put(("image_progress", (label, n_exist, n_exist)))
         return idx, "skipped", n_exist, ""
 
     def _success(n, note=""):
@@ -852,81 +778,44 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
         _record_download(idx, key, uid, label, "成功", n, note)
         return idx, "success", n, note
 
+
     for attempt in range(retry + 1):
         if _stop_event.is_set():
             _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
             _record_download(idx, key, uid, label, "停止", 0)
             return idx, "stopped", 0, "已停止"
-        subdir = os.path.join(OUTPUT_ROOT, _safe_name(key))
-        n_files = _count_dcm(subdir)
-
-        # 增量核对：本地已有文件时，先用 IMAGE 级 C-Find 列出缺失影像
-        missing = None
-        if n_files > 0:
-            missing = find_missing_sop_uids(cfg, uid, subdir)
-            if missing is not None and not missing:
-                # 本地已齐全（如之前下载过但清单丢失）：直接算成功，不重拉
-                _ui_queue.put(("log", "[%d/%d] [完成] %s 本地已齐全（%d 个文件，增量核对通过）" % (idx, total, label, n_files)))
-                return _success(n_files, "增量核对齐全")
-
-        if missing:
-            # 增量补拉：只重拉缺失的影像，不整 Study 重拉
-            _ui_queue.put(("log", "[%d/%d] [增量补拉] %s：缺失 %d 个，仅补拉缺失部分" % (idx, total, label, len(missing))))
-            has_error, code = pull_images(cfg, uid, missing, cfg.local_aet)
-            n_files = _count_dcm(subdir)
-            if not has_error:
-                missing2 = find_missing_sop_uids(cfg, uid, subdir)
-                if not missing2:  # [] 齐全 或 None 无法核对，均视为完成
-                    _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（增量补拉完成） %s" % (idx, total, label, n_files, subdir)))
-                    return _success(n_files, "增量补拉完成")
-                fail_msg = "增量补拉后仍缺 %d 个（可能是前置机侧该影像本身有问题）" % len(missing2)
-            else:
-                fail_msg = "增量补拉状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
-        else:
-            # 首次拉取 或 无法增量核对：整 Study 全量拉取
-            assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
-            if assoc and assoc.is_established:
+        # 全量拉取该 Study（前置机不支持 IMAGE/SERIES 级查询，无法精准补拉，接受个别失败）
+        assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
+        if assoc and assoc.is_established:
+            try:
+                has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
+                _current_expected_images = n_total
+                _ui_queue.put(("image_progress", (label, n_files, n_total)))
+            finally:
+                _unregister_assoc(assoc)
                 try:
-                    has_error, code, n_files, subdir, n_failed, n_warned = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
-                finally:
-                    _unregister_assoc(assoc)
-                    try:
-                        assoc.release()
-                    except Exception:
-                        pass
-                # 双重判定：状态码 0x0000 且本地至少落盘 1 个 .dcm 才视为成功
-                if not has_error and n_files > 0:
-                    # 仅当状态码为 0x0000 且无子操作失败/警告时才算完全成功；
-                    # 若状态码是 0xB000（即使前置机没回填失败计数），也要走增量补拉
-                    if n_failed == 0 and n_warned == 0 and code == 0x0000:
-                        _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
-                        return _success(n_files)
-                    # 子操作有失败/警告：增量补拉缺失影像一次
-                    _ui_queue.put(("log", "[%d/%d] [补拉] 前置机报告子操作 %d 失败/%d 警告，增量补拉缺失影像" % (idx, total, n_failed, n_warned)))
-                    miss = find_missing_sop_uids(cfg, uid, subdir)
-                    if miss is None:
-                        # 前置机不支持 IMAGE 级查询，无法核对：有文件即视为成功（带提醒）
-                        _ui_queue.put(("log", "[%d/%d] [提醒] %s 无法增量核对（前置机可能不支持 IMAGE 级查询），按文件数视为成功" % (idx, total, label)))
-                        return _success(n_files, "子操作 %d 失败/%d 警告，无法增量核对" % (n_failed, n_warned))
-                    if miss:
-                        pull_images(cfg, uid, miss, cfg.local_aet)
-                        n_files = _count_dcm(subdir)
-                    miss2 = find_missing_sop_uids(cfg, uid, subdir)
-                    if not miss2:
-                        _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（补拉完成） %s" % (idx, total, label, n_files, subdir)))
-                        return _success(n_files, "补拉完成")
-                    fail_msg = "子操作 %d 失败/%d 警告，补拉后仍缺 %d 个" % (n_failed, n_warned, len(miss2))
-                elif has_error:
-                    fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
-                else:
-                    # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
-                    ips = "、".join(_local_ips()) or "未知"
-                    fail_msg = ("C-Move 状态成功但等待 30 秒后仍 0 个文件落盘。"
-                                "请核对：1) 医院前置机上「%s」注册的 IP 是否为本机当前 IP（%s）；"
-                                "2) 注册端口是否为 %d；3) Windows 防火墙是否放行 %d 入站。"
-                                % (cfg.local_aet, ips, cfg.local_port, cfg.local_port))
+                    assoc.release()
+                except Exception:
+                    pass
+            if not has_error and n_files > 0:
+                # 状态码 0x0000 且无子操作失败/警告：完全成功
+                if n_failed == 0 and n_warned == 0 and code == 0x0000:
+                    _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
+                    return _success(n_files)
+                # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
+                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, subdir)))
+                return _success(n_files, "子操作 %d 失败/%d 警告" % (n_failed, n_warned))
+            elif has_error:
+                fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
             else:
-                fail_msg = "连接 PACS 失败"
+                # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
+                ips = "、".join(_local_ips()) or "未知"
+                fail_msg = ("C-Move 状态成功但等待 30 秒后仍 0 个文件落盘。"
+                            "请核对：1) 医院前置机上「%s」注册的 IP 是否为本机当前 IP（%s）；"
+                            "2) 注册端口是否为 %d；3) Windows 防火墙是否放行 %d 入站。"
+                            % (cfg.local_aet, ips, cfg.local_port, cfg.local_port))
+        else:
+            fail_msg = "连接 PACS 失败"
         if attempt < retry:
             _ui_queue.put(("log", "[%d/%d] [重试 %d/%d] %s：%s，%d 秒后重试" % (
                 idx, total, attempt + 1, retry, label, fail_msg, delay)))
@@ -962,13 +851,14 @@ def batch_download(cfg):
 
 def _batch_download_inner(cfg):
     global OUTPUT_ROOT, _rate_limit_kbps, _current_key_type
-    global _rate_last_time, _rate_tokens
+    global _rate_last_time, _rate_tokens, _download_start_time
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
 
     OUTPUT_ROOT = cfg.out_dir
     _current_key_type = getattr(cfg, "key_type", "patient_id") or "patient_id"
+    _download_start_time = time.time()  # 记录本次下载开始时间
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     _rate_limit_kbps = int(getattr(cfg, "rate_limit_kbps", 0) or 0)
     _rate_last_time = 0.0
@@ -1052,7 +942,7 @@ def _batch_download_inner(cfg):
             break
         _ui_queue.put(("progress", (i, total)))
         _ui_queue.put(("log", "[%d/%d] 拉取 %s" % (i, total, label)))
-        _idx, status, n_files, msg = _download_one(cfg, key, label, uid, i, total, manifest_set)
+        _idx, status, _, _ = _download_one(cfg, key, label, uid, i, total, manifest_set)
         if status == "success":
             ok += 1
         elif status == "skipped":
@@ -1201,6 +1091,14 @@ class App:
         self.progress.pack(fill="x", padx=10, pady=4)
         self.var_status = tk.StringVar(value="就绪")
         ttk.Label(self.root, textvariable=self.var_status).pack(anchor="w", padx=12)
+        # 第二行：当前检查的影像张数 + 总张数 + 已耗时
+        info_row = ttk.Frame(self.root)
+        info_row.pack(fill="x", padx=12, pady=(0, 4))
+        self.var_image_count = tk.StringVar(value="影像数: 0 / ?")
+        ttk.Label(info_row, textvariable=self.var_image_count).pack(side="left")
+        ttk.Label(info_row, text="    ").pack(side="left")
+        self.var_elapsed = tk.StringVar(value="已耗时: 00:00:00")
+        ttk.Label(info_row, textvariable=self.var_elapsed).pack(side="left")
 
         # 日志
         self.log = scrolledtext.ScrolledText(self.root, height=16, state="disabled", wrap="word")
@@ -1357,6 +1255,13 @@ class App:
         self.btn_stop.config(state="normal")
         self.btn_history.config(state="disabled")
         self.var_status.set("下载中...")
+        self.var_image_count.set("影像数: 0 / ?")
+        self.var_elapsed.set("已耗时: 00:00:00")
+        # 启动 1Hz 定时器刷新"已耗时"显示
+        self._download_start_ts = time.time()
+        self._tick_after_id = None
+        self._tick_running = True
+        self._tick_update()
 
         self.thread = threading.Thread(target=batch_download, args=(cfg,), daemon=True)
         self.thread.start()
@@ -1421,6 +1326,14 @@ class App:
 
     def _reset_ui(self, status_text=None):
         """复位按钮/状态（下载线程结束或出错时调用），保证界面不会卡死。"""
+        # 停止 1Hz 定时器
+        self._tick_running = False
+        if getattr(self, "_tick_after_id", None) is not None:
+            try:
+                self.root.after_cancel(self._tick_after_id)
+            except Exception:
+                pass
+            self._tick_after_id = None
         # 恢复所有输入框为可编辑（下载结束/异常退出时）
         for attr in ("pacs_host", "pacs_port", "pacs_aet", "local_aet", "local_port",
                      "excel", "out", "column", "sheet", "key_type",
@@ -1437,6 +1350,27 @@ class App:
         self.btn_stop.config(state="disabled")
         if status_text:
             self.var_status.set(status_text)
+
+    def _tick_update(self):
+        """每秒刷新"已耗时"，下载结束后自动停止。"""
+        try:
+            if not getattr(self, "_tick_running", False):
+                return
+            start = getattr(self, "_download_start_ts", None)
+            if start is not None:
+                elapsed = max(0, int(time.time() - start))
+                self.var_elapsed.set("已耗时: " + self._format_hms(elapsed))
+            self._tick_after_id = self.root.after(1000, self._tick_update)
+        except Exception:
+            self._tick_after_id = None
+
+    @staticmethod
+    def _format_hms(seconds):
+        s = int(seconds)
+        h = s // 3600
+        m = (s % 3600) // 60
+        sec = s % 60
+        return "%02d:%02d:%02d" % (h, m, sec)
 
     def _show_history(self):
         """弹出下载记录列表窗口。"""
@@ -1526,6 +1460,14 @@ class App:
                         if total > 0:
                             self.progress["value"] = done * 100.0 / total
                             self.var_status.set("进度 %d / %d" % (done, total))
+                    elif kind == "image_progress":
+                        # (label, n_files, n_total) - 当前检查的影像张数进度
+                        try:
+                            _lbl, n_done, n_total = payload
+                            total_str = str(n_total) if n_total > 0 else "?"
+                            self.var_image_count.set("当前[%s] 影像数: %d / %s" % (_lbl, n_done, total_str))
+                        except Exception:
+                            pass
                     elif kind == "status":
                         self.var_status.set(payload)
                     elif kind == "done":
