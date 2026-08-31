@@ -161,7 +161,10 @@ def handle_store(event):
         # 通知 GUI：当前检查已收到一个影像
         try:
             n_in_dir = _count_dcm(d)
-            _ui_queue.put(("image_progress", (_current_label, n_in_dir, _current_expected_images)))
+            # 分母用累计最大值：handle_store 是异步回调，可能在 pull_one_study 下一次更新
+            # _current_expected_images 之前就读到比 n_in_dir 小的旧值，导致瞬间「分子 > 分母」
+            n_total = max(n_in_dir, _current_expected_images)
+            _ui_queue.put(("image_progress", (_current_label, n_in_dir, n_total)))
         except Exception:
             pass
         return 0x0000  # Success
@@ -499,7 +502,17 @@ def find_studies_by_patient(assoc, patient_id):
 
 
 def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
-    """拉取一个 Study，影像落到 out_root/<folder_key>/ 目录（folder_key 缺省用 study_uid）。"""
+    """拉取一个 Study，影像落到 out_root/<folder_key>/ 目录（folder_key 缺省用 study_uid）。
+
+    C-Move 进行中（Pending 状态）会实时用「已完成 + 失败 + 警告」估算前置机已确定的子操作数，
+    累计取最大值（避免某些前置机实现不规范导致分母倒退），并立即更新全局 _current_expected_images，
+    让 handle_store 后续发的 image_progress 也能用上新分母；前置机不报子操作计数时退化为 C-Move
+    完成后再用 n_files + n_failed + n_warned 兜底作为分母。
+
+    注意：NumberOfRemainingSuboperations 在该前置机上不可信（剩余=0 但已完成还在涨），
+    所以不参与估算，仅在日志中展示。
+    """
+    global _current_expected_images
     folder = folder_key or study_uid
     subdir = os.path.join(out_root, _safe_name(folder))
     os.makedirs(subdir, exist_ok=True)
@@ -514,6 +527,7 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
     has_error = False
     n_failed = 0    # 子操作失败数（前置机推送失败的影像数）
     n_warned = 0    # 子操作警告数
+    expected_total_max = 0  # 累计最大的"前置机应推总数"估算（取最大值避免分母倒退）
     try:
         # send_c_move(dataset, move_aet, query_model) - query_model 必须位置参数
         for status, _ in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
@@ -528,6 +542,24 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
                     n_failed = int(failed)
                 if warned is not None:
                     n_warned = int(warned)
+                # 估算前置机已确定要推的总数：只用 已完成 + 失败 + 警告
+                # 注意：NumberOfRemainingSuboperations 在该前置机上不可信（剩余=0 但已完成还在涨，
+                # 说明它只在前几个 Pending 报一次或干脆不更新；强行参与估算会导致分母小于分子）
+                if completed is not None or failed is not None or warned is not None:
+                    c_val = int(completed) if completed is not None else 0
+                    f_val = int(failed) if failed is not None else 0
+                    w_val = int(warned) if warned is not None else 0
+                    est_from_subops = c_val + f_val + w_val
+                    # 取「子操作估算值」与「当前已落盘数」的较大者，防止前置机的"已完成"上报有延迟
+                    # 时显示「分子 > 分母」；同时永不倒退
+                    n_files_now = _count_dcm(subdir)
+                    est = max(est_from_subops, n_files_now, expected_total_max)
+                    if est > expected_total_max:
+                        expected_total_max = est
+                        # 实时更新全局分母：handle_store 后续发的 image_progress 会立即用上新分母
+                        _current_expected_images = est
+                        # 主动推一次进度，让 UI 立即从「X / ?」变成「X / N」
+                        _ui_queue.put(("image_progress", (_current_label, n_files_now, est)))
                 extra = ""
                 if remaining is not None or completed is not None:
                     extra = " (剩余=%s 已完成=%s 失败=%s 警告=%s)" % (remaining, completed, failed, warned)
@@ -555,8 +587,9 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
             if n_files > 0:
                 break
     _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件" % (final_code, _status_text(final_code), n_files)))
-    # n_total = 已收到 + 已失败 + 已警告 = 前置机本应推送的影像总数（用于 GUI 显示 "X / N"）
-    n_total = n_files + n_failed + n_warned
+    # n_total 兜底：取 (已落盘 + 已失败 + 已警告)、(累计最大预期值)、(已落盘数) 三者最大
+    # 防止前置机"剩余=0 但还在异步推"导致最终分母小于实际收到的影像数
+    n_total = max(n_files + n_failed + n_warned, expected_total_max, n_files)
     return has_error, final_code, n_files, subdir, n_failed, n_warned, n_total
 
 
