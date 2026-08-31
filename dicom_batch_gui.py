@@ -56,6 +56,7 @@ _rate_last_time = 0.0          # 令牌桶：上次补充令牌的时间
 _rate_tokens = 0.0             # 令牌桶：当前可用令牌（字节）
 _active_assocs = []            # 当前活跃的 DICOM association，停止时强制中断
 _assoc_lock = threading.Lock()
+_current_key_type = "patient_id"  # 当前下载模式：patient_id(按病人ID) / study_uid(按StudyUID)，Store SCP 据此决定落盘目录名
 
 # 下载结果记录（每次下载一条，最终写入 CSV 报告并在 GUI 历史列表展示）
 _download_records = []
@@ -127,13 +128,17 @@ def handle_store(event):
         if not OUTPUT_ROOT:
             _ui_queue.put(("log", "[StoreSCP] 收到 DICOM 但输出目录未就绪，已拒绝：SOP=%s" % sop_uid))
             return 0xC000
-        if study_uid:
-            # 优先按图像自带的 StudyInstanceUID 定位目录（并发下载时不会串目录）
-            d = os.path.join(OUTPUT_ROOT, _safe_name(study_uid))
+        if _current_key_type == "patient_id":
+            # 按病人ID归档：优先用图像自带的 PatientID 作目录名，缺失时回落到 StudyInstanceUID
+            patient_id = getattr(ds, "PatientID", None)
+            folder_key = patient_id or study_uid
         else:
-            # 缺失 StudyInstanceUID 的异常文件统一兜底，避免并发时串到别的目录
+            folder_key = study_uid
+        if folder_key:
+            d = os.path.join(OUTPUT_ROOT, _safe_name(folder_key))
+        else:
             d = os.path.join(OUTPUT_ROOT, "_unknown_study")
-            _ui_queue.put(("log", "[StoreSCP] 收到缺少 StudyInstanceUID 的文件，落入 _unknown_study/"))
+            _ui_queue.put(("log", "[StoreSCP] 收到缺少定位字段的文件，落入 _unknown_study/"))
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, _safe_name(sop_uid) + ".dcm")
         # 极少数情况下（pynetdicom 内部并发回调）save_as 可能撞到 Windows 文件锁
@@ -492,9 +497,10 @@ def find_studies_by_patient(assoc, patient_id):
     return uids
 
 
-def pull_one_study(assoc, study_uid, local_aet, out_root):
-    """拉取一个 Study，影像落到 out_root/<study_uid>/ 目录。"""
-    subdir = os.path.join(out_root, _safe_name(study_uid))
+def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
+    """拉取一个 Study，影像落到 out_root/<folder_key>/ 目录（folder_key 缺省用 study_uid）。"""
+    folder = folder_key or study_uid
+    subdir = os.path.join(out_root, _safe_name(folder))
     os.makedirs(subdir, exist_ok=True)
 
     ds = Dataset()
@@ -779,11 +785,11 @@ def _append_manifest_uid(uid):
         _ui_queue.put(("log", "[清单] 写入成功清单失败：%s" % e))
 
 
-def _already_downloaded(uid, manifest_set):
-    """断点续传判断：以“成功清单”为准，清单里有的视为已成功。"""
+def _already_downloaded(uid, manifest_set, folder_key):
+    """断点续传判断：以“成功清单”为准，清单里有的视为已成功。folder_key 用于统计本地落盘数。"""
     if uid in manifest_set:
         # 顺便统计本地落盘数（仅供日志显示，不影响跳过判断）
-        d = os.path.join(OUTPUT_ROOT, _safe_name(uid))
+        d = os.path.join(OUTPUT_ROOT, _safe_name(folder_key))
         n = 0
         if os.path.isdir(d):
             try:
@@ -833,7 +839,7 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
         return idx, "stopped", 0, "已停止"
 
     # 断点续传：成功清单里有该 UID 则跳过（精准判断，不受半成品影响）
-    exists, n_exist = _already_downloaded(uid, manifest_set)
+    exists, n_exist = _already_downloaded(uid, manifest_set, key)
     if exists:
         _ui_queue.put(("log", "[%d/%d] [跳过] %s（成功清单已存在，本地 %d 个文件，不重复下载）" % (idx, total, label, n_exist)))
         _record_download(idx, key, uid, label, "已存在(跳过)", n_exist)
@@ -851,7 +857,7 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
             _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
             _record_download(idx, key, uid, label, "停止", 0)
             return idx, "stopped", 0, "已停止"
-        subdir = os.path.join(OUTPUT_ROOT, _safe_name(uid))
+        subdir = os.path.join(OUTPUT_ROOT, _safe_name(key))
         n_files = _count_dcm(subdir)
 
         # 增量核对：本地已有文件时，先用 IMAGE 级 C-Find 列出缺失影像
@@ -881,7 +887,7 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
             assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
             if assoc and assoc.is_established:
                 try:
-                    has_error, code, n_files, subdir, n_failed, n_warned = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT)
+                    has_error, code, n_files, subdir, n_failed, n_warned = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
                 finally:
                     _unregister_assoc(assoc)
                     try:
@@ -955,13 +961,14 @@ def batch_download(cfg):
 
 
 def _batch_download_inner(cfg):
-    global OUTPUT_ROOT, _rate_limit_kbps
+    global OUTPUT_ROOT, _rate_limit_kbps, _current_key_type
     global _rate_last_time, _rate_tokens
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
 
     OUTPUT_ROOT = cfg.out_dir
+    _current_key_type = getattr(cfg, "key_type", "patient_id") or "patient_id"
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     _rate_limit_kbps = int(getattr(cfg, "rate_limit_kbps", 0) or 0)
     _rate_last_time = 0.0
