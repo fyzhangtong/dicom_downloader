@@ -28,6 +28,11 @@ from tkinter import ttk, filedialog, messagebox, scrolledtext
 
 from pynetdicom import AE, evt
 from pynetdicom.presentation import StoragePresentationContexts
+try:
+    # 更全的存储 SOP 类（含各类压缩格式），能接收更多推送，减少前置机"子操作失败"
+    from pynetdicom.presentation import AllStoragePresentationContexts as _ALL_STORAGE_CTX
+except Exception:
+    _ALL_STORAGE_CTX = None
 from pynetdicom.sop_class import (
     StudyRootQueryRetrieveInformationModelFind,
     StudyRootQueryRetrieveInformationModelMove,
@@ -80,6 +85,35 @@ def _safe_name(s):
     safe = "".join(c if (c.isalnum() or c in "._-") else "_" for c in s)
     # 极端兜底：纯特殊字符（如 NULL 字节）会被全部替换为 _，但仍然是非空
     return safe if safe.strip("_") else "unnamed"
+
+
+def _on_conn_open(event):
+    """Store SCP 收到入站连接时记录来源，便于判断 PACS 是否真的在往本机推影像。"""
+    try:
+        addr = "%s:%s" % (event.address[0], event.address[1])
+    except Exception:
+        addr = "未知"
+    _ui_queue.put(("log", "[StoreSCP] 收到入站连接：%s" % addr))
+
+
+def _count_dcm(subdir):
+    try:
+        return len([f for f in os.listdir(subdir) if f.endswith(".dcm")])
+    except Exception:
+        return 0
+
+
+def _local_ips():
+    """本机非回环 IPv4 地址列表，用于核对 PACS 侧注册的 IP。"""
+    ips = []
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            ip = info[4][0]
+            if ip not in ips:
+                ips.append(ip)
+    except Exception:
+        pass
+    return ips
 
 
 def handle_store(event):
@@ -191,11 +225,13 @@ def start_store_scp(local_aet, local_port):
         time.sleep(0.3)
 
     ae = AE()
+    # 优先用更全的存储上下文（含压缩格式），减少前置机因"格式不被接收"而子操作失败
+    storage_ctxs = _ALL_STORAGE_CTX or StoragePresentationContexts
     # StoragePresentationContexts 是列表，需要逐个 add_supported_context（pynetdicom 3.x 没有复数 API）
-    for ctx in StoragePresentationContexts:
+    for ctx in storage_ctxs:
         ae.add_supported_context(ctx.abstract_syntax, ctx.transfer_syntax)
     ae.add_requested_context(Verification)
-    handlers = [(evt.EVT_C_STORE, handle_store)]
+    handlers = [(evt.EVT_C_STORE, handle_store), (evt.EVT_CONN_OPEN, _on_conn_open)]
     # 优先用属性设置 AE Title（所有 pynetdicom 版本通用，2.x 之前 start_server 不支持 ae_title 关键字）
     try:
         ae.ae_title = local_aet
@@ -219,7 +255,8 @@ def start_store_scp(local_aet, local_port):
     _store_started = True
     _store_aet = local_aet
     _store_port = local_port
-    _ui_queue.put(("log", "[StoreSCP] 接收服务已启动：AE=%s 端口=%d" % (local_aet, local_port)))
+    ips = "、".join(_local_ips()) or "未知"
+    _ui_queue.put(("log", "[StoreSCP] 接收服务已启动：AE=%s 端口=%d（本机 IP：%s，请确认与前置机注册一致）" % (local_aet, local_port, ips)))
     return True
 
 
@@ -468,6 +505,8 @@ def pull_one_study(assoc, study_uid, local_aet, out_root):
 
     final_code = 0x0000
     has_error = False
+    n_failed = 0    # 子操作失败数（前置机推送失败的影像数）
+    n_warned = 0    # 子操作警告数
     try:
         # 3.x 签名：send_c_move(dataset, move_aet, query_model) - query_model 必须位置参数
         for status, _ in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
@@ -478,21 +517,120 @@ def pull_one_study(assoc, study_uid, local_aet, out_root):
                 completed = getattr(status, "NumberOfCompletedSuboperations", None)
                 failed = getattr(status, "NumberOfFailedSuboperations", None)
                 warned = getattr(status, "NumberOfWarningSuboperations", None)
+                if failed is not None:
+                    n_failed = int(failed)
+                if warned is not None:
+                    n_warned = int(warned)
                 extra = ""
                 if remaining is not None or completed is not None:
                     extra = " (剩余=%s 已完成=%s 失败=%s 警告=%s)" % (remaining, completed, failed, warned)
                 _ui_queue.put(("log", "      [C-Move] 响应状态 0x%04X %s%s" % (code, _status_text(code), extra)))
                 if code not in _PENDING:
-                    if code != 0x0000:
-                        final_code = code
+                    final_code = code
+                    # 0xB000=警告:子操作完成但有失败，属于“部分成功”，不当作硬错误；
+                    # 交由 _download_one 依据 n_failed/n_warned 走增量补拉，避免整 Study 全量重拉
+                    if code not in (0x0000, 0xB000):
                         has_error = True
     except Exception as e:
         has_error = True
         _ui_queue.put(("log", "      [C-Move 异常] %s" % e))
 
-    n_files = len([f for f in os.listdir(subdir) if f.endswith(".dcm")]) if os.path.isdir(subdir) else 0
+    n_files = _count_dcm(subdir)
+    # 部分医院前置机是"先返回 C-Move 成功、再异步推送影像"，
+    # 状态成功但暂时 0 文件时，最多等 30 秒观察文件是否陆续落盘
+    if not has_error and n_files == 0:
+        _ui_queue.put(("log", "      [C-Move] 状态成功但暂无文件落盘，等待前置机异步推送（最多 30 秒）..."))
+        for _ in range(60):
+            time.sleep(0.5)
+            if _stop_event.is_set():
+                break
+            n_files = _count_dcm(subdir)
+            if n_files > 0:
+                break
     _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件" % (final_code, _status_text(final_code), n_files)))
-    return has_error, final_code, n_files, subdir
+    return has_error, final_code, n_files, subdir, n_failed, n_warned
+
+
+def find_missing_sop_uids(cfg, study_uid, subdir):
+    """IMAGE 级 C-Find 列出该 Study 应有的全部 SOPInstanceUID，与本地已落盘文件对比，
+    返回缺失的 UID 列表。查询失败/无结果时返回 None（表示无法增量核对，需整 Study 重拉）。"""
+    assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelFind, "C-Find", "cfind_timeout", 60)
+    if not (assoc and assoc.is_established):
+        return None
+    try:
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "IMAGE"
+        ds.StudyInstanceUID = study_uid
+        ds.SOPInstanceUID = ""
+        expected = []
+        seen = set()
+        try:
+            for status, identifier in assoc.send_c_find(ds, StudyRootQueryRetrieveInformationModelFind):
+                if identifier:
+                    suid = getattr(identifier, "SOPInstanceUID", None)
+                    if suid:
+                        s = str(suid)
+                        if s not in seen:
+                            seen.add(s)
+                            expected.append(s)
+        except Exception as e:
+            _ui_queue.put(("log", "      [增量核对] IMAGE 级 C-Find 异常：%s" % e))
+            return None
+        if not expected:
+            # 前置机可能不支持 IMAGE 级查询
+            return None
+        local = set()
+        try:
+            for f in os.listdir(subdir):
+                if f.endswith(".dcm"):
+                    local.add(f[:-4])  # 文件名即 _safe_name(SOPInstanceUID)
+        except Exception:
+            pass
+        missing = [u for u in expected if _safe_name(u) not in local]
+        _ui_queue.put(("log", "      [增量核对] 前置机应有 %d 个影像，本地已有 %d 个，缺失 %d 个" % (
+            len(expected), len(local), len(missing))))
+        return missing
+    finally:
+        _unregister_assoc(assoc)
+        try:
+            assoc.release()
+        except Exception:
+            pass
+
+
+def pull_images(cfg, study_uid, sop_uids, local_aet):
+    """IMAGE 级 C-Move 只补拉指定影像。返回 (has_error, final_code)。"""
+    assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
+    if not (assoc and assoc.is_established):
+        return True, 0xA700
+    try:
+        ds = Dataset()
+        ds.QueryRetrieveLevel = "IMAGE"
+        ds.StudyInstanceUID = study_uid
+        ds.SOPInstanceUID = sop_uids
+        final_code = 0x0000
+        has_error = False
+        try:
+            for status, _ in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
+                if status:
+                    code = status.Status
+                    if code not in _PENDING:
+                        _ui_queue.put(("log", "      [补拉] 响应状态 0x%04X %s" % (code, _status_text(code))))
+                        final_code = code
+                        # 0xB000 同样视为“部分成功”，回到调用处做二次增量核对，
+                        # 而不是直接判定失败进入重试
+                        if code not in (0x0000, 0xB000):
+                            has_error = True
+        except Exception as e:
+            has_error = True
+            _ui_queue.put(("log", "      [补拉 异常] %s" % e))
+        return has_error, final_code
+    finally:
+        _unregister_assoc(assoc)
+        try:
+            assoc.release()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -508,7 +646,7 @@ class DownloadConfig:
         self.excel_path = ""
         self.sheet_name = ""
         self.column = "影像号"
-        self.key_type = "study_uid"   # study_uid(StudyInstanceUID) / patient_id(病人ID)
+        self.key_type = "patient_id"  # patient_id(病人ID) / study_uid(StudyInstanceUID)，默认按病人ID
         self.out_dir = ""
         self.rate_limit_kbps = 0      # 限速（KB/s），0 = 不限
         self.pause_every = 0          # 每下载 N 个检查后暂停（仅串行模式），0 = 不启用
@@ -701,36 +839,88 @@ def _download_one(cfg, key, label, uid, idx, total, manifest_set):
         _record_download(idx, key, uid, label, "已存在(跳过)", n_exist)
         return idx, "skipped", n_exist, ""
 
+    def _success(n, note=""):
+        """成功统一出口：写成功清单 + 记录 + 返回。"""
+        _append_manifest_uid(uid)
+        manifest_set.add(uid)
+        _record_download(idx, key, uid, label, "成功", n, note)
+        return idx, "success", n, note
+
     for attempt in range(retry + 1):
         if _stop_event.is_set():
             _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
             _record_download(idx, key, uid, label, "停止", 0)
             return idx, "stopped", 0, "已停止"
-        assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
-        if assoc and assoc.is_established:
-            try:
-                has_error, code, n_files, subdir = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT)
-            finally:
-                _unregister_assoc(assoc)
-                try:
-                    assoc.release()
-                except Exception:
-                    pass
-            # 双重判定：状态码 0x0000 且本地至少落盘 1 个 .dcm 才视为成功
-            # （避免 C-Move 报成功但文件没拉完的边界情况，错误写入成功清单导致下次跳过）
-            if not has_error and n_files > 0:
-                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
-                _append_manifest_uid(uid)  # 仅成功才写清单
-                manifest_set.add(uid)
-                _record_download(idx, key, uid, label, "成功", n_files)
-                return idx, "success", n_files, ""
-            if has_error:
-                fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
+        subdir = os.path.join(OUTPUT_ROOT, _safe_name(uid))
+        n_files = _count_dcm(subdir)
+
+        # 增量核对：本地已有文件时，先用 IMAGE 级 C-Find 列出缺失影像
+        missing = None
+        if n_files > 0:
+            missing = find_missing_sop_uids(cfg, uid, subdir)
+            if missing is not None and not missing:
+                # 本地已齐全（如之前下载过但清单丢失）：直接算成功，不重拉
+                _ui_queue.put(("log", "[%d/%d] [完成] %s 本地已齐全（%d 个文件，增量核对通过）" % (idx, total, label, n_files)))
+                return _success(n_files, "增量核对齐全")
+
+        if missing:
+            # 增量补拉：只重拉缺失的影像，不整 Study 重拉
+            _ui_queue.put(("log", "[%d/%d] [增量补拉] %s：缺失 %d 个，仅补拉缺失部分" % (idx, total, label, len(missing))))
+            has_error, code = pull_images(cfg, uid, missing, cfg.local_aet)
+            n_files = _count_dcm(subdir)
+            if not has_error:
+                missing2 = find_missing_sop_uids(cfg, uid, subdir)
+                if not missing2:  # [] 齐全 或 None 无法核对，均视为完成
+                    _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（增量补拉完成） %s" % (idx, total, label, n_files, subdir)))
+                    return _success(n_files, "增量补拉完成")
+                fail_msg = "增量补拉后仍缺 %d 个（可能是前置机侧该影像本身有问题）" % len(missing2)
             else:
-                # 状态码成功但 0 文件：可能 PACS 端问题或网络中断在最后一个包
-                fail_msg = "C-Move 状态成功但本地 0 个文件，可能拉取中断"
+                fail_msg = "增量补拉状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
         else:
-            fail_msg = "连接 PACS 失败"
+            # 首次拉取 或 无法增量核对：整 Study 全量拉取
+            assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
+            if assoc and assoc.is_established:
+                try:
+                    has_error, code, n_files, subdir, n_failed, n_warned = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT)
+                finally:
+                    _unregister_assoc(assoc)
+                    try:
+                        assoc.release()
+                    except Exception:
+                        pass
+                # 双重判定：状态码 0x0000 且本地至少落盘 1 个 .dcm 才视为成功
+                if not has_error and n_files > 0:
+                    # 仅当状态码为 0x0000 且无子操作失败/警告时才算完全成功；
+                    # 若状态码是 0xB000（即使前置机没回填失败计数），也要走增量补拉
+                    if n_failed == 0 and n_warned == 0 and code == 0x0000:
+                        _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
+                        return _success(n_files)
+                    # 子操作有失败/警告：增量补拉缺失影像一次
+                    _ui_queue.put(("log", "[%d/%d] [补拉] 前置机报告子操作 %d 失败/%d 警告，增量补拉缺失影像" % (idx, total, n_failed, n_warned)))
+                    miss = find_missing_sop_uids(cfg, uid, subdir)
+                    if miss is None:
+                        # 前置机不支持 IMAGE 级查询，无法核对：有文件即视为成功（带提醒）
+                        _ui_queue.put(("log", "[%d/%d] [提醒] %s 无法增量核对（前置机可能不支持 IMAGE 级查询），按文件数视为成功" % (idx, total, label)))
+                        return _success(n_files, "子操作 %d 失败/%d 警告，无法增量核对" % (n_failed, n_warned))
+                    if miss:
+                        pull_images(cfg, uid, miss, cfg.local_aet)
+                        n_files = _count_dcm(subdir)
+                    miss2 = find_missing_sop_uids(cfg, uid, subdir)
+                    if not miss2:
+                        _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（补拉完成） %s" % (idx, total, label, n_files, subdir)))
+                        return _success(n_files, "补拉完成")
+                    fail_msg = "子操作 %d 失败/%d 警告，补拉后仍缺 %d 个" % (n_failed, n_warned, len(miss2))
+                elif has_error:
+                    fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
+                else:
+                    # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
+                    ips = "、".join(_local_ips()) or "未知"
+                    fail_msg = ("C-Move 状态成功但等待 30 秒后仍 0 个文件落盘。"
+                                "请核对：1) 医院前置机上「%s」注册的 IP 是否为本机当前 IP（%s）；"
+                                "2) 注册端口是否为 %d；3) Windows 防火墙是否放行 %d 入站。"
+                                % (cfg.local_aet, ips, cfg.local_port, cfg.local_port))
+            else:
+                fail_msg = "连接 PACS 失败"
         if attempt < retry:
             _ui_queue.put(("log", "[%d/%d] [重试 %d/%d] %s：%s，%d 秒后重试" % (
                 idx, total, attempt + 1, retry, label, fail_msg, delay)))
@@ -932,7 +1122,7 @@ class App:
 
         row_kt = ttk.Frame(f3); row_kt.pack(fill="x", **pad)
         ttk.Label(row_kt, text="查询键类型:").pack(side="left")
-        self.var_key_type = tk.StringVar(value="StudyInstanceUID(影像号UID)")
+        self.var_key_type = tk.StringVar(value="病人ID(patientId)")
         ttk.Combobox(
             row_kt, textvariable=self.var_key_type, state="readonly", width=28,
             values=["StudyInstanceUID(影像号UID)", "病人ID(patientId)"],
@@ -1195,7 +1385,7 @@ class App:
             self.var_out.set(str(self.cfg.out_dir or ""))
             self.var_column.set(str(self.cfg.column or "影像号"))
             self.var_sheet.set(str(self.cfg.sheet_name or ""))
-            if getattr(self.cfg, "key_type", "study_uid") == "patient_id":
+            if getattr(self.cfg, "key_type", "patient_id") == "patient_id":
                 self.var_key_type.set("病人ID(patientId)")
             else:
                 self.var_key_type.set("StudyInstanceUID(影像号UID)")
