@@ -54,13 +54,18 @@ _rate_limit_kbps = 0           # 传输限速（KB/s），0 = 不限；由批量
 _rate_lock = threading.Lock()
 _rate_last_time = 0.0          # 令牌桶：上次补充令牌的时间
 _rate_tokens = 0.0             # 令牌桶：当前可用令牌（字节）
+_throttle_cap_logged = False   # 限速封顶提示是否已输出（避免刷屏）
 _active_assocs = []            # 当前活跃的 DICOM association，停止时强制中断
 _assoc_lock = threading.Lock()
-_current_key_type = "patient_id"  # 当前下载模式：patient_id(按病人ID) / study_uid(按StudyUID)，Store SCP 据此决定落盘目录名
 # 当前正在下载的检查信息（供 handle_store 通知 GUI 进度用）
 _current_label = ""
 _current_expected_images = 0   # 前置机报告的预期影像数（用于显示"X / N"）
 _download_start_time = 0.0     # 本次批量下载的开始时间戳（用于"已耗时"）
+_diag_log = False              # 诊断日志开关：PDU/协商/Pending 细节默认隐藏，排查时打开
+# 反向探测状态：检测连通时发空 C-Move，观察前置机是否主动连入本机接收服务
+_probe_active = False
+_probe_conn_event = threading.Event()
+_probe_conn_addr = ""
 
 # 下载结果记录（每次下载一条，最终写入 CSV 报告并在 GUI 历史列表展示）
 _download_records = []
@@ -68,6 +73,12 @@ _records_lock = threading.Lock()
 
 # 线程间通信队列（工作线程 -> GUI 主线程）
 _ui_queue = queue.Queue()
+
+
+def _diag(msg):
+    """诊断日志：仅在打开「诊断日志」开关时输出（PDU/协商/Pending 等细节）。"""
+    if _diag_log:
+        _ui_queue.put(("log", msg))
 
 
 def get_app_dir():
@@ -94,11 +105,130 @@ def _safe_name(s):
 
 def _on_conn_open(event):
     """Store SCP 收到入站连接时记录来源，便于判断 PACS 是否真的在往本机推影像。"""
+    global _probe_conn_addr
     try:
         addr = "%s:%s" % (event.address[0], event.address[1])
     except Exception:
         addr = "未知"
     _ui_queue.put(("log", "[StoreSCP] 收到入站连接：%s" % addr))
+    if _probe_active:
+        _probe_conn_addr = addr
+        _probe_conn_event.set()
+
+
+def _on_conn_close(event):
+    """Store SCP 连接关闭时记录来源，配合「入站连接」判断对方连上后做了什么。"""
+    try:
+        addr = "%s:%s" % (event.address[0], event.address[1])
+    except Exception:
+        addr = "未知"
+    _ui_queue.put(("log", "[StoreSCP] 连接关闭：%s" % addr))
+
+
+def _on_echo(event):
+    """Store SCP 支持 C-ECHO：部分前置机推影像前会先对目标 AE 做 C-ECHO 校验，
+    不支持会导致对方中止推送（表现为 C-Move 成功但 0 文件落盘）。"""
+    try:
+        addr = "%s:%s" % (event.assoc.remote_address[0], event.assoc.remote_address[1])
+    except Exception:
+        addr = "未知"
+    _ui_queue.put(("log", "[StoreSCP] 收到 C-ECHO 校验：%s（已应答成功）" % addr))
+    return 0x0000
+
+
+def _ae_str(v):
+    """AE Title 可能是 bytes，统一转成可读字符串。"""
+    try:
+        if isinstance(v, bytes):
+            return v.decode("ascii", "replace").strip()
+        return str(v)
+    except Exception:
+        return "?"
+
+
+def _cx_abstract_name(cx):
+    try:
+        return cx.abstract_syntax.name
+    except Exception:
+        try:
+            return str(cx.abstract_syntax)
+        except Exception:
+            return "?"
+
+
+def _cx_transfer_name(cx):
+    try:
+        ts = cx.transfer_syntax
+        if isinstance(ts, (list, tuple)):
+            ts = ts[0] if ts else ""
+        return _ae_str(ts)
+    except Exception:
+        return "?"
+
+
+def _pdu_summary(pdu):
+    """PDU 一行摘要。P-DATA-TF（影像数据块）只输出字节长度，避免刷屏。"""
+    name = type(pdu).__name__
+    if name == "P_DATA_TF":
+        try:
+            n = pdu.pdu_length
+        except Exception:
+            n = -1
+        return "P-DATA-TF（数据块 %d 字节）" % n
+    return name
+
+
+def _make_pdu_handlers(side):
+    """带侧别前缀的 PDU 捕获处理器（诊断级，默认不输出），避免 SCU/SCP 两侧日志混淆。"""
+
+    def _recv(event):
+        try:
+            _diag("[%s][PDU←] %s" % (side, _pdu_summary(event.pdu)))
+        except Exception:
+            pass
+
+    def _sent(event):
+        try:
+            _diag("[%s][PDU→] %s" % (side, _pdu_summary(event.pdu)))
+        except Exception:
+            pass
+
+    return _recv, _sent
+
+
+def _log_assoc_negotiation(assoc, tag):
+    """输出关联协商结果（双方 AE、同意/拒绝的呈现上下文）。诊断级，默认不输出。"""
+    try:
+        remote = "%s:%s" % (assoc.remote_address[0], assoc.remote_address[1])
+    except Exception:
+        remote = "未知"
+    try:
+        calling = _ae_str(assoc.requestor.primitive.calling_ae_title)
+        called = _ae_str(assoc.requestor.primitive.called_ae_title)
+    except Exception:
+        calling, called = "?", "?"
+    _diag("[%s] 关联协商完成：对端=%s 调用方AE=%s 被叫方AE=%s" % (tag, remote, calling, called))
+    try:
+        for cx in assoc.accepted_contexts:
+            _diag("[%s]   [同意] %s / %s" % (tag, _cx_abstract_name(cx), _cx_transfer_name(cx)))
+        for cx in assoc.rejected_contexts:
+            _diag("[%s]   [拒绝] %s" % (tag, _cx_abstract_name(cx)))
+    except Exception:
+        pass
+
+
+def _on_accepted(event):
+    """Store SCP 接受关联时输出协商结果：排查"对方连上却不发 C-STORE"。"""
+    _log_assoc_negotiation(event.assoc, "StoreSCP协商")
+
+
+def _on_aborted(event):
+    """关联被 ABORT 时记录来源：区分"对方主动中止"与"正常释放"。"""
+    try:
+        addr = "%s:%s" % (event.assoc.remote_address[0], event.assoc.remote_address[1])
+    except Exception:
+        addr = "未知"
+    _ui_queue.put(("log", "[StoreSCP] 关联被中止（A-ABORT）：%s" % addr))
 
 
 def _count_dcm(subdir):
@@ -132,12 +262,9 @@ def handle_store(event):
         if not OUTPUT_ROOT:
             _ui_queue.put(("log", "[StoreSCP] 收到 DICOM 但输出目录未就绪，已拒绝：SOP=%s" % sop_uid))
             return 0xC000
-        if _current_key_type == "patient_id":
-            # 按病人ID归档：优先用图像自带的 PatientID 作目录名，缺失时回落到 StudyInstanceUID
-            patient_id = getattr(ds, "PatientID", None)
-            folder_key = patient_id or study_uid
-        else:
-            folder_key = study_uid
+        # 统一优先用图像自带的 PatientID 作目录名（缺失时回落到 StudyInstanceUID）
+        patient_id = getattr(ds, "PatientID", None)
+        folder_key = patient_id or study_uid
         if folder_key:
             d = os.path.join(OUTPUT_ROOT, _safe_name(folder_key))
         else:
@@ -174,12 +301,18 @@ def handle_store(event):
 
 
 def _throttle(size_bytes):
-    """全局限速（并发安全，令牌桶）：把多个 C-STORE 的总下行速率压到目标值。"""
-    global _rate_last_time, _rate_tokens
+    """全局限速（并发安全，令牌桶）：把多个 C-STORE 的总下行速率压到目标值。
+
+    注意：限速通过"延迟 C-STORE 应答"实现，前置机若长时间收不到应答会把该子操作
+    记为失败（表现为 failed=N、最终 0xA702）。因此单文件等待封顶 2 秒：
+    限速值过低时实际速率会高于设定值，但保证下载不被前置机超时打断。
+    """
+    global _rate_last_time, _rate_tokens, _throttle_cap_logged
     limit = _rate_limit_kbps
     if limit <= 0 or size_bytes <= 0:
         return
     rate = limit * 1024.0  # 字节/秒
+    waited = 0.0
     while True:
         with _rate_lock:
             now = time.time()
@@ -194,8 +327,15 @@ def _throttle(size_bytes):
                 _rate_tokens -= size_bytes
                 return
             need = (size_bytes - _rate_tokens) / rate
-        # 令牌不足：在锁外等待，再回来重试
-        time.sleep(min(need, 5.0))
+        # 单文件等待封顶 2 秒：避免 C-STORE 应答过慢被前置机判超时（failed/0xA702）
+        if waited >= 2.0:
+            if not _throttle_cap_logged:
+                _throttle_cap_logged = True
+                _ui_queue.put(("log", "[限速] 限速值过低，单文件等待已封顶 2 秒，实际速率将高于设定值（不影响下载成功）"))
+            return
+        step = min(need, 5.0, 2.0 - waited)
+        time.sleep(step)
+        waited += step
 
 
 def _try_bind_port(port):
@@ -249,7 +389,19 @@ def start_store_scp(local_aet, local_port):
     for ctx in storage_ctxs:
         ae.add_supported_context(ctx.abstract_syntax, ctx.transfer_syntax)
     ae.add_requested_context(Verification)
-    handlers = [(evt.EVT_C_STORE, handle_store), (evt.EVT_CONN_OPEN, _on_conn_open)]
+    # 作为 SCP 也要支持 C-ECHO：部分前置机推影像前先对目标 AE 做 C-ECHO 校验
+    ae.add_supported_context(Verification)
+    pdu_recv, pdu_sent = _make_pdu_handlers("SCP")
+    handlers = [
+        (evt.EVT_C_STORE, handle_store),
+        (evt.EVT_C_ECHO, _on_echo),
+        (evt.EVT_CONN_OPEN, _on_conn_open),
+        (evt.EVT_CONN_CLOSE, _on_conn_close),
+        (evt.EVT_ACCEPTED, _on_accepted),
+        (evt.EVT_ABORTED, _on_aborted),
+        (evt.EVT_PDU_RECV, pdu_recv),
+        (evt.EVT_PDU_SENT, pdu_sent),
+    ]
     try:
         ae.ae_title = local_aet
     except Exception:
@@ -272,31 +424,47 @@ def start_store_scp(local_aet, local_port):
 # ---------------------------------------------------------------------------
 # 2) 网络可达性检测
 # ---------------------------------------------------------------------------
-def test_connectivity(host, port, aet=None, local_port=None):
+def test_connectivity(host, port, aet=None, local_port=None, local_aet=None):
     """
-    检测 PACS 前置机可达性。
+    双向检测 PACS 前置机与本机的连通性。
     返回 (ok, messages)：
-        1. TCP 端口连通性检查（判断网络/端口是否可达）
-        2. DICOM C-Echo 检查（判断 DICOM 服务与 AE Title 是否有效，需要提供 aet）
-        3. 本机接收端口自检（判断下载时能否绑定本地端口，需要提供 local_port）
+        正向（本机 -> 前置机）：
+            1. TCP 端口连通性检查
+            2. DICOM C-Echo 检查（验证前置机服务与 AE Title，需要提供 aet）
+        反向（前置机 -> 本机）：
+            3. 本机接收服务自检：经本机外部 IP 连接收服务并 C-Echo（需要 local_port/local_aet）
+            4. 前置机反向探测：发一个不存在 UID 的 C-Move，观察前置机是否主动连入本机
+               接收服务（仅作参考提示，不影响 ok 判定，因为部分前置机对 0 匹配不连目标）
+        本机接收端口自检：启动 Store SCP 本身即端口绑定测试
     """
+    global _probe_active, _probe_conn_addr
     msgs = []
     tcp_ok = False
     echo_ok = False
     local_ok = True
+    self_ok = True
 
-    # 0) 本机接收端口自检（与 PACS 无关，先查，避免"测试成功但下载绑定失败"）
-    # 注意：本工具的 Store SCP 若已在监听该端口，属于正常占用，跳过自检
-    if local_port and not (_store_started and _store_port == local_port):
-        ok, err = _try_bind_port(local_port)
-        if ok:
-            msgs.append("本机接收端口自检：端口 %d 可正常绑定" % local_port)
-        else:
-            local_ok = False
-            msgs.append("本机接收端口自检失败：端口 %d 无法绑定（%s）" % (local_port, err))
-            msgs.append(_port_bind_hint(local_port))
+    # 0) 确保本机接收服务在运行（反向检测依赖它；启动本身即端口绑定自检）
+    store_ready = False
+    if local_port:
+        if local_aet:
+            store_ready = start_store_scp(local_aet, local_port)
+            if store_ready:
+                msgs.append("本机接收服务就绪：AE=%s 端口=%d" % (local_aet, local_port))
+            else:
+                local_ok = False
+                msgs.append("本机接收服务启动失败：端口 %d 无法绑定" % local_port)
+                msgs.append(_port_bind_hint(local_port))
+        elif not (_store_started and _store_port == local_port):
+            ok, err = _try_bind_port(local_port)
+            if ok:
+                msgs.append("本机接收端口自检：端口 %d 可正常绑定" % local_port)
+            else:
+                local_ok = False
+                msgs.append("本机接收端口自检失败：端口 %d 无法绑定（%s）" % (local_port, err))
+                msgs.append(_port_bind_hint(local_port))
 
-    # 1) TCP 连通性
+    # 1) TCP 连通性（正向）
     try:
         sock = socket.create_connection((host, port), timeout=5)
         sock.close()
@@ -307,41 +475,122 @@ def test_connectivity(host, port, aet=None, local_port=None):
         msgs.append("请检查：IP/端口是否正确、网络是否连通、是否需 VPN/白名单")
         return False, msgs
 
-    # 2) DICOM C-Echo（验证 AE Title 与 DICOM 服务）
+    # 2) DICOM C-Echo（正向：验证前置机服务与 AE Title）
     if not aet:
-        msgs.append("未填写 AE Title，跳过 DICOM C-Echo 验证")
-        return (tcp_ok and local_ok), msgs
-
-    try:
-        ae = AE()
-        ae.add_requested_context(Verification)
-        ae.acse_timeout = 10
-        ae.network_timeout = 10
-        assoc = ae.associate(host, port, ae_title=aet)
-        if assoc.is_established:
-            try:
-                status = assoc.send_c_echo()
-                if status and getattr(status, "Status", None) == 0x0000:
-                    echo_ok = True
-                    msgs.append("DICOM C-Echo 成功：AE Title=%s 有效" % aet)
-                else:
-                    msgs.append("DICOM C-Echo 未返回成功状态")
-            finally:
+        msgs.append("未填写 PACS AE Title，跳过正向 DICOM C-Echo 验证")
+    else:
+        try:
+            ae = AE()
+            ae.add_requested_context(Verification)
+            ae.acse_timeout = 10
+            ae.network_timeout = 10
+            assoc = ae.associate(host, port, ae_title=aet)
+            if assoc.is_established:
+                try:
+                    status = assoc.send_c_echo()
+                    if status and getattr(status, "Status", None) == 0x0000:
+                        echo_ok = True
+                        msgs.append("正向 DICOM C-Echo 成功：AE Title=%s 有效" % aet)
+                    else:
+                        msgs.append("正向 DICOM C-Echo 未返回成功状态")
+                finally:
+                    try:
+                        assoc.release()
+                    except Exception:
+                        pass
+            else:
+                msgs.append("正向 DICOM 关联建立失败：请检查 AE Title=%s 是否正确" % aet)
+                # 未建立时也要尝试 release 释放 socket 资源
                 try:
                     assoc.release()
                 except Exception:
                     pass
-        else:
-            msgs.append("DICOM 关联建立失败：请检查 AE Title=%s 是否正确" % aet)
-            # 未建立时也要尝试 release 释放 socket 资源
-            try:
-                assoc.release()
-            except Exception:
-                pass
-    except Exception as e:
-        msgs.append("DICOM C-Echo 异常：%s" % e)
+        except Exception as e:
+            msgs.append("正向 DICOM C-Echo 异常：%s" % e)
 
-    return (tcp_ok and local_ok and (echo_ok if aet else True)), msgs
+    # 3) 反向自检：经本机外部 IP 连自己的接收服务并 C-Echo（验证监听/AE/应答全链路）
+    # 逐个外部 IP 尝试（VPN/虚拟网卡可能不可路由，任一成功即视为通过）
+    if store_ready or (_store_started and local_port and _store_port == local_port):
+        self_ok = False
+        self_err = ""
+        for self_ip in (_local_ips() or ["127.0.0.1"]):
+            try:
+                ae = AE()
+                ae.add_requested_context(Verification)
+                ae.acse_timeout = 5
+                ae.network_timeout = 5
+                assoc = ae.associate(self_ip, local_port, ae_title=local_aet or "SELFECHO")
+                if assoc.is_established:
+                    try:
+                        st = assoc.send_c_echo()
+                        if st and getattr(st, "Status", None) == 0x0000:
+                            msgs.append("反向自检成功：经 %s:%d 可达本机接收服务且 C-Echo 应答正常" % (self_ip, local_port))
+                            self_ok = True
+                        else:
+                            self_err = "C-Echo 应答异常"
+                    finally:
+                        try:
+                            assoc.release()
+                        except Exception:
+                            pass
+                else:
+                    self_err = "无法建立关联"
+                    try:
+                        assoc.release()
+                    except Exception:
+                        pass
+            except Exception as e:
+                self_err = str(e)
+            if self_ok:
+                break
+        if not self_ok:
+            msgs.append("反向自检失败（%s）：请检查 Windows 防火墙是否放行端口 %d 入站" % (self_err, local_port))
+
+    # 4) 前置机反向探测：发不存在 UID 的 C-Move，观察前置机是否主动连入本机（仅提示）
+    if (store_ready or (_store_started and local_port and _store_port == local_port)) and aet and local_aet:
+        _probe_conn_event.clear()
+        _probe_conn_addr = ""
+        _probe_active = True
+        try:
+            ae = AE()
+            ae.add_requested_context(StudyRootQueryRetrieveInformationModelMove)
+            ae.acse_timeout = 10
+            ae.dimse_timeout = 5
+            ae.network_timeout = 10
+            assoc = ae.associate(host, port, ae_title=aet)
+            if assoc.is_established:
+                try:
+                    ds = Dataset()
+                    ds.QueryRetrieveLevel = "STUDY"
+                    ds.StudyInstanceUID = "1.2.3.999.999999.999999999"  # 不存在的 UID
+                    for _st, _id in assoc.send_c_move(ds, local_aet, StudyRootQueryRetrieveInformationModelMove):
+                        break  # 只需触发前置机动作，取首个响应即退出
+                except Exception:
+                    pass
+                finally:
+                    try:
+                        assoc.release()
+                    except Exception:
+                        pass
+                if _probe_conn_event.wait(8):
+                    msgs.append("反向探测成功：前置机已主动连入本机接收服务（%s），反向通道正常" % _probe_conn_addr)
+                else:
+                    ips = "、".join(_local_ips()) or "未知"
+                    msgs.append("反向探测：8 秒内前置机未连入本机接收服务。"
+                                "若下载仍 0 文件，请核对前置机上「%s」注册的 IP/端口是否为本机（%s / %d）"
+                                % (local_aet, ips, local_port))
+            else:
+                msgs.append("反向探测跳过：无法与 PACS 建立关联")
+                try:
+                    assoc.release()
+                except Exception:
+                    pass
+        except Exception as e:
+            msgs.append("反向探测异常：%s" % e)
+        finally:
+            _probe_active = False
+
+    return (tcp_ok and local_ok and self_ok and (echo_ok if aet else True)), msgs
 
 
 # ---------------------------------------------------------------------------
@@ -563,7 +812,11 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
                 extra = ""
                 if remaining is not None or completed is not None:
                     extra = " (剩余=%s 已完成=%s 失败=%s 警告=%s)" % (remaining, completed, failed, warned)
-                _ui_queue.put(("log", "      [C-Move] 响应状态 0x%04X %s%s" % (code, _status_text(code), extra)))
+                msg = "      [C-Move] 响应状态 0x%04X %s%s" % (code, _status_text(code), extra)
+                if code in _PENDING:
+                    _diag(msg)  # Pending 过程日志默认隐藏，避免刷屏
+                else:
+                    _ui_queue.put(("log", msg))
                 if code not in _PENDING:
                     final_code = code
                     # 0xB000=警告:子操作完成但有失败，属于“部分成功”，不当作硬错误；
@@ -611,10 +864,8 @@ class DownloadConfig:
         self.rate_limit_kbps = 0      # 限速（KB/s），0 = 不限
         self.pause_every = 0          # 每下载 N 个检查后暂停（仅串行模式），0 = 不启用
         self.pause_seconds = 30       # 暂停秒数
-        self.cmove_timeout = 300      # C-MOVE 单次最大等待（秒），超时后重试
-        self.cfind_timeout = 60       # C-FIND 单次最大等待（秒）
-        self.cmove_retry = 1          # C-MOVE 失败/超时后重试次数
-        self.cmove_retry_delay = 3    # C-MOVE 重试间隔（秒）
+        self.cmove_timeout = 300      # C-MOVE 超时（秒）
+        self.cfind_timeout = 60       # C-FIND 超时（秒）
 
 
 def _register_assoc(assoc):
@@ -648,8 +899,16 @@ def _make_assoc(cfg, sop_class, label, timeout_attr, timeout_default):
     ae.acse_timeout = 15
     ae.dimse_timeout = int(getattr(cfg, timeout_attr, timeout_default) or timeout_default)
     ae.network_timeout = 30
+    # 诊断：SCU 侧关联协商结果 + 底层 PDU 流捕获
+    pdu_recv, pdu_sent = _make_pdu_handlers("SCU")
+    handlers = [
+        (evt.EVT_ACCEPTED, _on_accepted_scu),
+        (evt.EVT_ABORTED, _on_aborted_scu),
+        (evt.EVT_PDU_RECV, pdu_recv),
+        (evt.EVT_PDU_SENT, pdu_sent),
+    ]
     try:
-        assoc = ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet)
+        assoc = ae.associate(cfg.pacs_host, cfg.pacs_port, ae_title=cfg.pacs_aet, evt_handlers=handlers)
     except Exception as e:
         _ui_queue.put(("log", "[%s] 连接 PACS 异常：%s" % (label, e)))
         return None
@@ -662,6 +921,18 @@ def _make_assoc(cfg, sop_class, label, timeout_attr, timeout_default):
         except Exception:
             pass
     return assoc
+
+
+def _on_accepted_scu(event):
+    _log_assoc_negotiation(event.assoc, "SCU协商")
+
+
+def _on_aborted_scu(event):
+    try:
+        addr = "%s:%s" % (event.assoc.remote_address[0], event.assoc.remote_address[1])
+    except Exception:
+        addr = "未知"
+    _ui_queue.put(("log", "[SCU] 关联被中止（A-ABORT）：%s" % addr))
 
 
 def _record_download(idx, key, uid, label, status, n_files, message=""):
@@ -690,70 +961,6 @@ def _snapshot_records():
         return list(_download_records)
 
 
-_MANIFEST_LOCK = threading.Lock()
-
-
-def _manifest_path():
-    """成功清单文件路径（与下载输出同目录）。"""
-    if not OUTPUT_ROOT:
-        return None
-    return os.path.join(OUTPUT_ROOT, "成功清单.csv")
-
-
-def _load_manifest_uids():
-    """读取成功清单，返回 set。文件不存在或异常时返回空集。"""
-    p = _manifest_path()
-    if not p or not os.path.isfile(p):
-        return set()
-    s = set()
-    try:
-        with _MANIFEST_LOCK:
-            with open(p, "r", encoding="utf-8-sig", newline="") as f:
-                r = csv.reader(f)
-                for row in r:
-                    if not row:
-                        continue
-                    cell = row[0].strip()
-                    if cell and cell.lower() != "studyinstanceuid":
-                        s.add(cell)
-    except Exception as e:
-        _ui_queue.put(("log", "[清单] 读取成功清单失败：%s" % e))
-    return s
-
-
-def _append_manifest_uid(uid):
-    """下载成功后追加一条 UID 到成功清单。"""
-    p = _manifest_path()
-    if not p:
-        return
-    try:
-        with _MANIFEST_LOCK:
-            os.makedirs(OUTPUT_ROOT, exist_ok=True)
-            new_file = not os.path.isfile(p)
-            with open(p, "a", encoding="utf-8-sig", newline="") as f:
-                w = csv.writer(f)
-                if new_file:
-                    w.writerow(["StudyInstanceUID"])
-                w.writerow([uid])
-    except Exception as e:
-        _ui_queue.put(("log", "[清单] 写入成功清单失败：%s" % e))
-
-
-def _already_downloaded(uid, manifest_set, folder_key):
-    """断点续传判断：以“成功清单”为准，清单里有的视为已成功。folder_key 用于统计本地落盘数。"""
-    if uid in manifest_set:
-        # 顺便统计本地落盘数（仅供日志显示，不影响跳过判断）
-        d = os.path.join(OUTPUT_ROOT, _safe_name(folder_key))
-        n = 0
-        if os.path.isdir(d):
-            try:
-                n = len([f for f in os.listdir(d) if f.endswith(".dcm")])
-            except Exception:
-                n = 0
-        return True, n
-    return False, 0
-
-
 _REPORT_HEADER = ["序号", "查询键", "StudyInstanceUID", "结果", "文件数", "说明", "时间"]
 
 
@@ -779,82 +986,56 @@ def _write_report_csv(records, out_root):
         return None
 
 
-def _download_one(cfg, key, label, uid, idx, total, manifest_set):
-    """下载单个 Study（失败/超时自动重试，已存在则跳过）。返回 (idx, status, n_files, message)。"""
+def _download_one(cfg, key, label, uid, idx, total):
+    """下载单个 Study（不重试）。返回 (idx, status, n_files, message)。"""
     global _current_label, _current_expected_images
     _current_label = label
     _current_expected_images = 0  # 拉取前未知，由 pull_one_study 返回值/异常时回填
-    retry = int(getattr(cfg, "cmove_retry", 1) or 1)
-    delay = int(getattr(cfg, "cmove_retry_delay", 3) or 3)
-    fail_msg = ""
     n_files = 0
 
-    # 停止优先于断点续传：停止后剩余任务统一记为“停止”
+    # 停止优先：停止后剩余任务统一记为“停止”
     if _stop_event.is_set():
         _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
         _record_download(idx, key, uid, label, "停止", 0)
         return idx, "stopped", 0, "已停止"
 
-    # 断点续传：成功清单里有该 UID 则跳过（精准判断，不受半成品影响）
-    exists, n_exist = _already_downloaded(uid, manifest_set, key)
-    if exists:
-        _ui_queue.put(("log", "[%d/%d] [跳过] %s（成功清单已存在，本地 %d 个文件，不重复下载）" % (idx, total, label, n_exist)))
-        _record_download(idx, key, uid, label, "已存在(跳过)", n_exist)
-        # 同步 UI 进度条：当前检查"已完整"，预期数标记为已有数（N==n 视为完成）
-        _ui_queue.put(("image_progress", (label, n_exist, n_exist)))
-        return idx, "skipped", n_exist, ""
-
     def _success(n, note=""):
-        """成功统一出口：写成功清单 + 记录 + 返回。"""
-        _append_manifest_uid(uid)
-        manifest_set.add(uid)
+        """成功统一出口：记录 + 返回。"""
         _record_download(idx, key, uid, label, "成功", n, note)
         return idx, "success", n, note
 
-
-    for attempt in range(retry + 1):
-        if _stop_event.is_set():
-            _ui_queue.put(("log", "[%d/%d] [跳过] %s（手动停止）" % (idx, total, label)))
-            _record_download(idx, key, uid, label, "停止", 0)
-            return idx, "stopped", 0, "已停止"
-        # 全量拉取该 Study（前置机不支持 IMAGE/SERIES 级查询，无法精准补拉，接受个别失败）
-        assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
-        if assoc and assoc.is_established:
+    # 全量拉取该 Study（前置机不支持 IMAGE/SERIES 级查询，无法精准补拉，接受个别失败）
+    assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
+    if assoc and assoc.is_established:
+        try:
+            has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
+            _current_expected_images = n_total
+            _ui_queue.put(("image_progress", (label, n_files, n_total)))
+        finally:
+            _unregister_assoc(assoc)
             try:
-                has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
-                _current_expected_images = n_total
-                _ui_queue.put(("image_progress", (label, n_files, n_total)))
-            finally:
-                _unregister_assoc(assoc)
-                try:
-                    assoc.release()
-                except Exception:
-                    pass
-            if not has_error and n_files > 0:
-                # 状态码 0x0000 且无子操作失败/警告：完全成功
-                if n_failed == 0 and n_warned == 0 and code == 0x0000:
-                    _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
-                    return _success(n_files)
-                # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
-                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, subdir)))
-                return _success(n_files, "子操作 %d 失败/%d 警告" % (n_failed, n_warned))
-            elif has_error:
-                fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
-            else:
-                # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
-                ips = "、".join(_local_ips()) or "未知"
-                fail_msg = ("C-Move 状态成功但等待 30 秒后仍 0 个文件落盘。"
-                            "请核对：1) 医院前置机上「%s」注册的 IP 是否为本机当前 IP（%s）；"
-                            "2) 注册端口是否为 %d；3) Windows 防火墙是否放行 %d 入站。"
-                            % (cfg.local_aet, ips, cfg.local_port, cfg.local_port))
+                assoc.release()
+            except Exception:
+                pass
+        if not has_error and n_files > 0:
+            # 状态码 0x0000 且无子操作失败/警告：完全成功
+            if n_failed == 0 and n_warned == 0 and code == 0x0000:
+                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
+                return _success(n_files)
+            # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
+            _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, subdir)))
+            return _success(n_files, "子操作 %d 失败/%d 警告" % (n_failed, n_warned))
+        elif has_error:
+            fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
         else:
-            fail_msg = "连接 PACS 失败"
-        if attempt < retry:
-            _ui_queue.put(("log", "[%d/%d] [重试 %d/%d] %s：%s，%d 秒后重试" % (
-                idx, total, attempt + 1, retry, label, fail_msg, delay)))
-            t_end = time.time() + delay
-            while time.time() < t_end and not _stop_event.is_set():
-                time.sleep(0.5)
+            # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
+            ips = "、".join(_local_ips()) or "未知"
+            fail_msg = ("C-Move 状态成功但等待 30 秒后仍 0 个文件落盘。"
+                        "请核对：1) 医院前置机上「%s」注册的 IP 是否为本机当前 IP（%s）；"
+                        "2) 注册端口是否为 %d；3) Windows 防火墙是否放行 %d 入站。"
+                        % (cfg.local_aet, ips, cfg.local_port, cfg.local_port))
+    else:
+        fail_msg = "连接 PACS 失败"
     _ui_queue.put(("log", "[%d/%d] [失败] %s：%s" % (idx, total, label, fail_msg)))
     _record_download(idx, key, uid, label, "失败", n_files, fail_msg)
     return idx, "failed", n_files, fail_msg
@@ -883,19 +1064,19 @@ def batch_download(cfg):
 
 
 def _batch_download_inner(cfg):
-    global OUTPUT_ROOT, _rate_limit_kbps, _current_key_type
-    global _rate_last_time, _rate_tokens, _download_start_time
+    global OUTPUT_ROOT, _rate_limit_kbps
+    global _rate_last_time, _rate_tokens, _download_start_time, _throttle_cap_logged
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
 
     OUTPUT_ROOT = cfg.out_dir
-    _current_key_type = getattr(cfg, "key_type", "patient_id") or "patient_id"
     _download_start_time = time.time()  # 记录本次下载开始时间
     os.makedirs(OUTPUT_ROOT, exist_ok=True)
     _rate_limit_kbps = int(getattr(cfg, "rate_limit_kbps", 0) or 0)
     _rate_last_time = 0.0
     _rate_tokens = 0.0
+    _throttle_cap_logged = False  # 每次下载重置，保证限速封顶提示能在每次下载时生效
     if _rate_limit_kbps > 0:
         _ui_queue.put(("log", "已启用限速：%d KB/s" % _rate_limit_kbps))
 
@@ -953,18 +1134,11 @@ def _batch_download_inner(cfg):
         _ui_queue.put(("error", "没有可下载的检查"))
         return
 
-    # 4) 串行下载（稳态，支持间隙暂停、停止中断、重试、断点续传）
+    # 4) 串行下载（稳态，支持间隙暂停、停止中断）
     cmove_timeout = int(getattr(cfg, "cmove_timeout", 300) or 300)
-    cmove_retry = int(getattr(cfg, "cmove_retry", 1) or 1)
-    _ui_queue.put(("log", "开始下载：串行（稳态），C-Move 超时=%d 秒，重试=%d 次" % (cmove_timeout, cmove_retry)))
-
-    # 加载成功清单（精准断点续传依据）
-    manifest_set = _load_manifest_uids()
-    if manifest_set:
-        _ui_queue.put(("log", "成功清单已加载：%d 个 UID 标记为已下载，将自动跳过" % len(manifest_set)))
+    _ui_queue.put(("log", "开始下载：串行（稳态），C-Move 超时=%d 秒" % cmove_timeout))
 
     ok = 0
-    skip = 0
     fail = 0
     pause_every = int(getattr(cfg, "pause_every", 0) or 0)
     pause_seconds = int(getattr(cfg, "pause_seconds", 0) or 0)
@@ -975,11 +1149,9 @@ def _batch_download_inner(cfg):
             break
         _ui_queue.put(("progress", (i, total)))
         _ui_queue.put(("log", "[%d/%d] 拉取 %s" % (i, total, label)))
-        _idx, status, _, _ = _download_one(cfg, key, label, uid, i, total, manifest_set)
+        _idx, status, _, _ = _download_one(cfg, key, label, uid, i, total)
         if status == "success":
             ok += 1
-        elif status == "skipped":
-            skip += 1
         elif status == "stopped":
             break
         else:
@@ -998,10 +1170,10 @@ def _batch_download_inner(cfg):
             _ui_queue.put(("log", "  [间隙] 暂停结束，继续下载"))
 
     if _stop_event.is_set():
-        _ui_queue.put(("done", "已停止：成功 %d / 跳过(已存在) %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, skip, fail, total)))
-        _ui_queue.put(("log", "已停止：成功 %d / 跳过 %d / 失败 %d / 共 %d" % (ok, skip, fail, total)))
+        _ui_queue.put(("done", "已停止：成功 %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, fail, total)))
+        _ui_queue.put(("log", "已停止：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
     else:
-        _ui_queue.put(("done", "下载完成：成功 %d / 跳过(已存在) %d / 失败 %d / 共 %d" % (ok, skip, fail, total)))
+        _ui_queue.put(("done", "下载完成：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
 
 
 # ---------------------------------------------------------------------------
@@ -1078,7 +1250,7 @@ class App:
         ttk.Label(row3, text="限速(KB/s):").pack(side="left")
         self.var_rate_limit = tk.StringVar(value="0")
         ttk.Entry(row3, textvariable=self.var_rate_limit, width=9).pack(side="left", padx=4)
-        ttk.Label(row3, text="(0=不限速, 如1024=1MB/s)").pack(side="left")
+        ttk.Label(row3, text="(0=不限速, 如1024=1MB/s; 过低会触发封顶保护)").pack(side="left")
 
         ttk.Label(row3, text="  每下载").pack(side="left", padx=(16, 0))
         self.var_pause_every = tk.StringVar(value="0")
@@ -1095,15 +1267,9 @@ class App:
         ttk.Label(row4, text="C-Find超时(秒):").pack(side="left", padx=(12, 0))
         self.var_cfind_timeout = tk.StringVar(value="60")
         ttk.Entry(row4, textvariable=self.var_cfind_timeout, width=6).pack(side="left", padx=4)
-
-        row5 = ttk.Frame(f3); row5.pack(fill="x", **pad)
-        ttk.Label(row5, text="重试次数:").pack(side="left")
-        self.var_cmove_retry = tk.StringVar(value="1")
-        ttk.Entry(row5, textvariable=self.var_cmove_retry, width=6).pack(side="left", padx=4)
-        ttk.Label(row5, text="(失败/超时后)").pack(side="left")
-        ttk.Label(row5, text="  重试间隔(秒):").pack(side="left", padx=(16, 0))
-        self.var_cmove_retry_delay = tk.StringVar(value="3")
-        ttk.Entry(row5, textvariable=self.var_cmove_retry_delay, width=6).pack(side="left", padx=4)
+        self.var_diag_log = tk.BooleanVar(value=False)
+        ttk.Checkbutton(row4, text="诊断日志", variable=self.var_diag_log,
+                        command=self._sync_diag).pack(side="left", padx=(12, 0))
 
         # 按钮区
         fbtn = ttk.Frame(self.root)
@@ -1143,6 +1309,19 @@ class App:
         var = tk.StringVar(value=default)
         ttk.Entry(r, textvariable=var, width=40).pack(side="left", padx=4)
         setattr(self, "var_" + attr, var)
+
+    def _iter_editable_widgets(self):
+        """遍历主窗口下所有 Entry/Combobox，用于下载期间统一禁用/恢复。
+        （原实现用 nametowidget(StringVar._name) 是无效的：StringVar 的 _name 是
+        Tcl 变量名而非 widget 路径，会静默失败，导致下载时输入框实际未被禁用。）"""
+
+        def walk(w):
+            for ch in w.winfo_children():
+                if isinstance(ch, (ttk.Entry, ttk.Combobox)):
+                    yield ch
+                yield from walk(ch)
+
+        yield from walk(self.root)
 
     # ----- 事件 -----
     def _browse_excel(self):
@@ -1196,23 +1375,6 @@ class App:
             c.cfind_timeout = int(self.var_cfind_timeout.get().strip() or 60)
         except ValueError:
             c.cfind_timeout = 60
-        try:
-            c.cmove_retry = int(self.var_cmove_retry.get().strip() or 1)
-        except ValueError:
-            c.cmove_retry = 1
-        # 夹逼：0=不重试；超过 5 没意义
-        if c.cmove_retry < 0:
-            c.cmove_retry = 0
-        elif c.cmove_retry > 5:
-            c.cmove_retry = 5
-        try:
-            c.cmove_retry_delay = int(self.var_cmove_retry_delay.get().strip() or 3)
-        except ValueError:
-            c.cmove_retry_delay = 3
-        if c.cmove_retry_delay < 1:
-            c.cmove_retry_delay = 1
-        elif c.cmove_retry_delay > 60:
-            c.cmove_retry_delay = 60
         return c
 
     def _test_connectivity(self):
@@ -1226,24 +1388,33 @@ class App:
             messagebox.showwarning("提示", "PACS 端口必须是数字")
             return
         aet = self.var_pacs_aet.get().strip() or None
+        local_aet = self.var_local_aet.get().strip() or None
         try:
             local_port = int(self.var_local_port.get().strip() or 11112)
         except ValueError:
             local_port = None
 
-        self._append_log("正在检测 %s:%d 连通性（含本机接收端口自检）..." % (host, port))
+        self._append_log("正在双向检测 %s:%d 连通性（正向 C-Echo + 反向接收探测）..." % (host, port))
         self.btn_test.config(state="disabled")
 
         def worker():
-            ok, msgs = test_connectivity(host, port, aet, local_port=local_port)
+            ok, msgs = test_connectivity(host, port, aet, local_port=local_port, local_aet=local_aet)
             _ui_queue.put(("conn_result", (ok, msgs)))
 
         threading.Thread(target=worker, daemon=True).start()
 
+    def _sync_diag(self):
+        """勾选/取消「诊断日志」立即生效（不必等下次开始下载）。"""
+        global _diag_log
+        _diag_log = bool(self.var_diag_log.get())
+        self._append_log("诊断日志已%s" % ("开启" if _diag_log else "关闭"))
+
     def _start(self):
+        global _diag_log
         if self.thread and self.thread.is_alive():
             messagebox.showinfo("提示", "已有下载任务在运行中")
             return
+        _diag_log = bool(self.var_diag_log.get())
         try:
             int(self.var_pacs_port.get().strip() or 104)
             int(self.var_local_port.get().strip() or 11112)
@@ -1273,16 +1444,11 @@ class App:
         self.progress["value"] = 0
         self._clear_log()
         # 启动后禁用关键输入框，防止中途修改导致与后台线程不一致
-        for attr in ("pacs_host", "pacs_port", "pacs_aet", "local_aet", "local_port",
-                     "excel", "out", "column", "sheet", "key_type",
-                     "rate_limit", "pause_every", "pause_seconds",
-                     "cmove_timeout", "cfind_timeout", "cmove_retry", "cmove_retry_delay"):
-            v = getattr(self, "var_" + attr, None)
-            if v is not None:
-                try:
-                    self.root.nametowidget(v._name).config(state="disabled")
-                except Exception:
-                    pass
+        for w in self._iter_editable_widgets():
+            try:
+                w.config(state="disabled")
+            except Exception:
+                pass
         self.btn_test.config(state="disabled")
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
@@ -1328,6 +1494,7 @@ class App:
             self.var_local_aet.set(str(self.cfg.local_aet or ""))
             self.var_local_port.set(str(self.cfg.local_port))
             self.var_out.set(str(self.cfg.out_dir or ""))
+            self.var_excel.set(str(self.cfg.excel_path or ""))
             self.var_column.set(str(self.cfg.column or "影像号"))
             self.var_sheet.set(str(self.cfg.sheet_name or ""))
             if getattr(self.cfg, "key_type", "patient_id") == "patient_id":
@@ -1339,8 +1506,6 @@ class App:
             self.var_pause_seconds.set(str(getattr(self.cfg, "pause_seconds", 30)))
             self.var_cmove_timeout.set(str(getattr(self.cfg, "cmove_timeout", 300)))
             self.var_cfind_timeout.set(str(getattr(self.cfg, "cfind_timeout", 60)))
-            self.var_cmove_retry.set(str(getattr(self.cfg, "cmove_retry", 1)))
-            self.var_cmove_retry_delay.set(str(getattr(self.cfg, "cmove_retry_delay", 3)))
             self._append_log("已自动加载配置：%s" % CONFIG_PATH)
         except Exception as e:
             print("load config error:", e)
@@ -1368,16 +1533,11 @@ class App:
                 pass
             self._tick_after_id = None
         # 恢复所有输入框为可编辑（下载结束/异常退出时）
-        for attr in ("pacs_host", "pacs_port", "pacs_aet", "local_aet", "local_port",
-                     "excel", "out", "column", "sheet", "key_type",
-                     "rate_limit", "pause_every", "pause_seconds",
-                     "cmove_timeout", "cfind_timeout", "cmove_retry", "cmove_retry_delay"):
-            v = getattr(self, "var_" + attr, None)
-            if v is not None:
-                try:
-                    self.root.nametowidget(v._name).config(state="normal")
-                except Exception:
-                    pass
+        for w in self._iter_editable_widgets():
+            try:
+                w.config(state="normal")
+            except Exception:
+                pass
         self.btn_test.config(state="normal")
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
@@ -1483,7 +1643,9 @@ class App:
                         ok, msgs = payload
                         for m in msgs:
                             self._append_log(m)
-                        self.btn_test.config(state="normal")
+                        # 仅在无下载任务运行时才恢复检测按钮，避免与下载期间的禁用冲突
+                        if not (self.thread and self.thread.is_alive()):
+                            self.btn_test.config(state="normal")
                         if ok:
                             self.root.after(50, lambda m=msgs: messagebox.showinfo("检测结果", "\n".join(m)))
                         else:
