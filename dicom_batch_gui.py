@@ -59,7 +59,13 @@ _active_assocs = []            # 当前活跃的 DICOM association，停止时�
 _assoc_lock = threading.Lock()
 # 当前正在下载的检查信息（供 handle_store 通知 GUI 进度用）
 _current_label = ""
+_current_study_uid = ""        # 当前正在下载的 StudyInstanceUID（handle_store 据此判断是否推送进度）
 _current_expected_images = 0   # 前置机报告的预期影像数（用于显示"X / N"）
+# 按 Study 精确统计本批次落盘情况：同一病人多个检查共用一个 PatientID 目录时，
+# 不能按目录计数（会把上一个检查的文件算进来），必须按影像自带的 StudyInstanceUID 计数
+_store_lock = threading.Lock()
+_store_counts = {}             # study_uid -> 本批次已保存文件数
+_store_dirs = {}               # study_uid -> 实际保存目录
 _download_start_time = 0.0     # 本次批量下载的开始时间戳（用于"已耗时"）
 _diag_log = False              # 诊断日志开关：PDU/协商/Pending 细节默认隐藏，排查时打开
 # 反向探测状态：检测连通时发空 C-Move，观察前置机是否主动连入本机接收服务
@@ -231,13 +237,6 @@ def _on_aborted(event):
     _ui_queue.put(("log", "[StoreSCP] 关联被中止（A-ABORT）：%s" % addr))
 
 
-def _count_dcm(subdir):
-    try:
-        return len([f for f in os.listdir(subdir) if f.endswith(".dcm")])
-    except Exception:
-        return 0
-
-
 def _local_ips():
     """本机非回环 IPv4 地址列表，用于核对 PACS 侧注册的 IP。"""
     ips = []
@@ -280,18 +279,23 @@ def handle_store(event):
             _ui_queue.put(("log", "[StoreSCP] 首次保存失败，重试一次：%s" % e))
             time.sleep(0.05)
             ds.save_as(path, enforce_file_format=True)
+        # 保存成功后才计数（并发安全）：按 Study 精确统计本批次落盘数与目录，
+        # 同一病人多个检查共用 PatientID 目录时，按目录计数会把其它检查的文件算进来
+        suid_key = str(study_uid) if study_uid else "_unknown"
+        with _store_lock:
+            _store_counts[suid_key] = _store_counts.get(suid_key, 0) + 1
+            _store_dirs[suid_key] = d
+            n_saved = _store_counts[suid_key]
         # 限速：按实际落盘文件大小节流，压低下行速率
         try:
             _throttle(os.path.getsize(path))
         except Exception:
             pass
-        # 通知 GUI：当前检查已收到一个影像
+        # 通知 GUI：仅当前正在下载的检查推送进度（避免上一个检查的尾部推送干扰当前进度条）
         try:
-            n_in_dir = _count_dcm(d)
-            # 分母用累计最大值：handle_store 是异步回调，可能在 pull_one_study 下一次更新
-            # _current_expected_images 之前就读到比 n_in_dir 小的旧值，导致瞬间「分子 > 分母」
-            n_total = max(n_in_dir, _current_expected_images)
-            _ui_queue.put(("image_progress", (_current_label, n_in_dir, n_total)))
+            if suid_key == _current_study_uid:
+                n_total = max(n_saved, _current_expected_images)
+                _ui_queue.put(("image_progress", (_current_label, n_saved, n_total)))
         except Exception:
             pass
         return 0x0000  # Success
@@ -750,8 +754,12 @@ def find_studies_by_patient(assoc, patient_id):
     return uids
 
 
-def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
-    """拉取一个 Study，影像落到 out_root/<folder_key>/ 目录（folder_key 缺省用 study_uid）。
+def pull_one_study(assoc, study_uid, local_aet):
+    """拉取一个 Study。影像保存目录由 handle_store 决定（统一按 PatientID 命名）。
+
+    本函数不再预建任何目录：文件数统计/校验按 Study 精确计数（handle_store 记录到
+    _store_counts），实际落盘目录从 _store_dirs 读取，避免产生以查询键命名的空文件夹，
+    也避免同一病人多个检查共用目录时互相串数。
 
     C-Move 进行中（Pending 状态）会实时用「已完成 + 失败 + 警告」估算前置机已确定的子操作数，
     累计取最大值（避免某些前置机实现不规范导致分母倒退），并立即更新全局 _current_expected_images，
@@ -762,9 +770,11 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
     所以不参与估算，仅在日志中展示。
     """
     global _current_expected_images
-    folder = folder_key or study_uid
-    subdir = os.path.join(out_root, _safe_name(folder))
-    os.makedirs(subdir, exist_ok=True)
+
+    def _n_files_now():
+        """本批次该 Study 已保存文件数（handle_store 尚未保存任何文件时为 0）。"""
+        with _store_lock:
+            return _store_counts.get(study_uid, 0)
 
     ds = Dataset()
     ds.QueryRetrieveLevel = "STUDY"
@@ -801,7 +811,7 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
                     est_from_subops = c_val + f_val + w_val
                     # 取「子操作估算值」与「当前已落盘数」的较大者，防止前置机的"已完成"上报有延迟
                     # 时显示「分子 > 分母」；同时永不倒退
-                    n_files_now = _count_dcm(subdir)
+                    n_files_now = _n_files_now()
                     est = max(est_from_subops, n_files_now, expected_total_max)
                     if est > expected_total_max:
                         expected_total_max = est
@@ -827,7 +837,7 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
         has_error = True
         _ui_queue.put(("log", "      [C-Move 异常] %s" % e))
 
-    n_files = _count_dcm(subdir)
+    n_files = _n_files_now()
     # 部分医院前置机是"先返回 C-Move 成功、再异步推送影像"，
     # 状态成功但暂时 0 文件时，最多等 30 秒观察文件是否陆续落盘
     if not has_error and n_files == 0:
@@ -836,14 +846,17 @@ def pull_one_study(assoc, study_uid, local_aet, out_root, folder_key=None):
             time.sleep(0.5)
             if _stop_event.is_set():
                 break
-            n_files = _count_dcm(subdir)
+            n_files = _n_files_now()
             if n_files > 0:
                 break
     _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件" % (final_code, _status_text(final_code), n_files)))
     # n_total 兜底：取 (已落盘 + 已失败 + 已警告)、(累计最大预期值)、(已落盘数) 三者最大
     # 防止前置机"剩余=0 但还在异步推"导致最终分母小于实际收到的影像数
     n_total = max(n_files + n_failed + n_warned, expected_total_max, n_files)
-    return has_error, final_code, n_files, subdir, n_failed, n_warned, n_total
+    # 返回实际落盘目录（handle_store 记录的真实目录），无文件落盘时为 None
+    with _store_lock:
+        real_dir = _store_dirs.get(study_uid)
+    return has_error, final_code, n_files, real_dir, n_failed, n_warned, n_total
 
 
 # ---------------------------------------------------------------------------
@@ -988,9 +1001,14 @@ def _write_report_csv(records, out_root):
 
 def _download_one(cfg, key, label, uid, idx, total):
     """下载单个 Study（不重试）。返回 (idx, status, n_files, message)。"""
-    global _current_label, _current_expected_images
+    global _current_label, _current_study_uid, _current_expected_images
     _current_label = label
-    _current_expected_images = 0  # 拉取前未知，由 pull_one_study 返回值/异常时回填
+    _current_study_uid = str(uid)  # handle_store 据此只推当前检查的进度
+    _current_expected_images = 0   # 拉取前未知，由 pull_one_study 返回值/异常时回填
+    # 清空本批次计数/目录表：上一个检查的残留推送不计入当前检查
+    with _store_lock:
+        _store_counts.clear()
+        _store_dirs.clear()
     n_files = 0
 
     # 停止优先：停止后剩余任务统一记为“停止”
@@ -1008,7 +1026,7 @@ def _download_one(cfg, key, label, uid, idx, total):
     assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
     if assoc and assoc.is_established:
         try:
-            has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet, OUTPUT_ROOT, key)
+            has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet)
             _current_expected_images = n_total
             _ui_queue.put(("image_progress", (label, n_files, n_total)))
         finally:
@@ -1017,13 +1035,15 @@ def _download_one(cfg, key, label, uid, idx, total):
                 assoc.release()
             except Exception:
                 pass
+        # subdir 为实际落盘目录（PatientID 命名）；无文件落盘时为 None
+        dir_hint = subdir or "（无文件落盘）"
         if not has_error and n_files > 0:
             # 状态码 0x0000 且无子操作失败/警告：完全成功
             if n_failed == 0 and n_warned == 0 and code == 0x0000:
-                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, subdir)))
+                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, dir_hint)))
                 return _success(n_files)
             # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
-            _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, subdir)))
+            _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, dir_hint)))
             return _success(n_files, "子操作 %d 失败/%d 警告" % (n_failed, n_warned))
         elif has_error:
             fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
@@ -1532,10 +1552,11 @@ class App:
             except Exception:
                 pass
             self._tick_after_id = None
-        # 恢复所有输入框为可编辑（下载结束/异常退出时）
+        # 恢复所有输入框为可编辑（下载结束/异常退出时）；
+        # Combobox 需恢复为 readonly（原本只读），避免被输入任意文本
         for w in self._iter_editable_widgets():
             try:
-                w.config(state="normal")
+                w.config(state="readonly" if isinstance(w, ttk.Combobox) else "normal")
             except Exception:
                 pass
         self.btn_test.config(state="normal")
