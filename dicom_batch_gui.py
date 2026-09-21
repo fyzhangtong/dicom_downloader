@@ -43,6 +43,17 @@ from pynetdicom.sop_class import (
 )
 from pydicom.dataset import Dataset
 
+import pydicom
+# 宽容解析（重要）：少数厂商会在私有标签里写入与 VR 不匹配的长度，pydicom 查不到私有标签
+# 的 VR 时会按 "0 bytes per value" 直接抛错，严格模式下整份文件会被判失败（旧脱敏工具正是
+# 在这类数据上全量失败）。打开该开关后按 UN 原始字节保留，随后由模块①的「清空私有标签」
+# 规则清掉，落盘仍是脱敏后的影像；「读取校验降级为警告」可避免同类不规范的标签中断流程。
+try:
+    pydicom.config.convert_wrong_length_to_UN = True
+    pydicom.config.settings.reading_validation_mode = pydicom.config.WARN
+except Exception:
+    pass
+
 
 # ---------------------------------------------------------------------------
 # 全局状态
@@ -73,6 +84,8 @@ _store_dirs = {}               # study_uid -> 正常影像保存目录（原始 
 _store_filtered_dirs = {}      # study_uid -> 过滤命中影像保存目录（_剂量报告/原始 PatientID）
 _store_filtered = {}           # study_uid -> 其中命中过滤规则的文件数
 _store_discarded = {}          # study_uid -> 其中按「不保存」开关被丢弃的文件数
+_store_failed = {}             # study_uid -> 其中处理失败（解析/脱敏异常）而拒绝落盘的文件数
+_store_failed_files = []       # 未落盘文件明细：study_uid / SOPInstanceUID / 原因 / 时间
 _download_start_time = 0.0     # 本次批量下载的开始时间戳（用于"已耗时"）
 _diag_log = False              # 诊断日志开关：PDU/协商/Pending 细节默认隐藏，排查时打开
 _desens_enabled = False        # 模块① 标签脱敏开关（下载开始时由配置设置）
@@ -81,6 +94,18 @@ _desens_opts = {"purge_private": True, "date_month": True, "time_clear": True}
 _filter_enabled = False        # 模块② 剂量报告/截屏过滤开关（下载开始时由配置设置）
 _filter_rules = []             # 模块② 已解析的过滤规则
 _filter_save_hit = True        # 命中的过滤影像是否保存（False = 直接丢弃不落盘）
+# 模块① 脱敏审计日志：**一个影像一行**，每个配置的规则字段各占一列，单元格为「原值 → 新值」，
+# 主键为影像保存的文件名。全局的日期压缩/时间清空与私有标签清空作用于任意数量的标签、
+# 无法预先确定列，统一汇总进「其它变更」列。
+# 注意：审计表含脱敏前的原值（PatientID 除外），属敏感文件。
+_desens_audit_rows = []        # 待落盘的审计行缓冲
+_desens_audit_csv = ""         # 本次下载的审计明细临时 CSV 路径
+_desens_audit_header = False   # 临时 CSV 是否已写过表头（每次下载重置）
+_desens_audit_fields = []      # 本次下载的字段列（"GGGG,EEEE" 列表，取自配置规则）
+_desens_audit_lock = threading.Lock()
+_DESENS_AUDIT_FLUSH = 2000     # 缓冲阈值：超过即刷盘
+_DESENS_AUDIT_FIXED_HEAD = ["影像文件名", "StudyInstanceUID", "脱敏后PatientID"]
+_DESENS_AUDIT_TAIL_HEAD = ["其它变更", "时间"]
 # 反向探测状态：检测连通时发空 C-Move，观察前置机是否主动连入本机接收服务
 _probe_active = False
 _probe_conn_event = threading.Event()
@@ -321,10 +346,42 @@ def _is_sequence(v):
         return False
 
 
-def _apply_one_rule(elem, rule):
-    """对单个元素套用一条标签脱敏规则。返回 True 表示该标签应被删除。"""
+def _audit_add(audit, elem, method, before, after):
+    """把一条「实际发生变化」的字段脱敏记录追加到 audit（audit 为 None 时忽略）。
+
+    PatientID 是主标识：审计表只保留脱敏后的值，原始 PatientID 不写入日志。
+    """
+    if audit is None:
+        return
+    tag = (elem.tag.group, elem.tag.element)
+    if tag == (0x0010, 0x0020):
+        before = "(原始值不记录)"
+    # 清空类操作的「脱敏后」写成空单元格在 Excel 里不易分辨，统一标注
+    after = "(空)" if after in (None, "") else str(after)
+    try:
+        from pydicom.datadict import keyword_for_tag
+        kw = keyword_for_tag((tag[0] << 16) | tag[1]) or ""
+    except Exception:
+        kw = ""
+    audit.append({
+        "tag": "%04X,%04X" % tag,
+        "keyword": kw,
+        "vr": elem.VR or "",
+        "method": _DESENS_METHOD_LABEL.get(method, method),
+        "before": before,
+        "after": after,
+    })
+
+
+def _apply_one_rule(elem, rule, audit=None):
+    """对单个元素套用一条标签脱敏规则。
+
+    返回 True 表示该标签应被删除。传入 audit 列表时，把实际发生变化的字段
+    追加进去（脱敏前后对比），供脱敏审计日志使用；未变化的字段不记录。
+    """
     method = rule.get("method")
     if method == "remove":
+        _audit_add(audit, elem, "remove", str(elem.value), "(已删除)")
         return True
     if method == "hash":
         try:
@@ -336,37 +393,51 @@ def _apply_one_rule(elem, rule):
         new = _sha512_trunc(old, n)
         if new and new != str(old).strip():
             elem.value = new
+            _audit_add(audit, elem, "hash", str(old), new)
     elif method == "replace":
         rep = rule.get("param", "")
         rep = "" if rep is None else str(rep)
         if str(elem.value).strip() != rep:
+            old = str(elem.value)
             elem.value = rep
+            _audit_add(audit, elem, "replace", old, rep)
     elif method == "clear":
         if str(elem.value or "").strip() != "":
+            old = str(elem.value)
             elem.value = ""
+            _audit_add(audit, elem, "clear", old, "")
     elif method == "birth_year":
         raw = str(elem.value or "").strip()
         if len(raw) >= 4:
             elem.value = raw[:4] + "0101"
+            _audit_add(audit, elem, "birth_year", raw, elem.value)
     elif method == "date_month":
         vr = elem.VR
         new = _trunc_datetime(elem.value) if vr == "DT" else _trunc_date(elem.value)
         if new != elem.value:
+            old = str(elem.value)
             elem.value = new
+            _audit_add(audit, elem, "date_month", old, new)
     elif method == "time_clear":
         if elem.VR == "TM" and elem.value not in (None, ""):
+            old = str(elem.value)
             elem.value = ""
+            _audit_add(audit, elem, "time_clear", old, "")
     return False
 
 
-def _deep_walk(ds, rules_map, recursive_map, opts):
+def _deep_walk(ds, rules_map, recursive_map, opts, audit=None):
     """递归套用脱敏规则。
 
     - rules_map：标签 -> 规则（顶层与递归规则都在内），命中即套用并跳过 VR 通用处理；
     - recursive_map：只含「作用于序列内」的规则，递归进序列时改用它；
-    - opts：全局开关（清空私有标签 / 日期压缩到月 / 时间清空），对所有层级生效。
+    - opts：全局开关（清空私有标签 / 日期压缩到月 / 时间清空），对所有层级生效；
+    - audit：可选，收集「实际发生的字段变更」供脱敏审计日志使用。
+
+    返回本层及所有嵌套层被删除的私有标签数量（供审计里汇总成一条记录）。
     """
     to_delete = []
+    n_private = 0
     for elem in list(ds):
         tag = (elem.tag.group, elem.tag.element)
         vr = elem.VR
@@ -374,19 +445,23 @@ def _deep_walk(ds, rules_map, recursive_map, opts):
 
         rule = rules_map.get(tag)
         if rule is not None and not is_seq:
-            if _apply_one_rule(elem, rule):
+            if _apply_one_rule(elem, rule, audit):
                 to_delete.append(elem.tag)
             continue
 
         if not is_seq:
             if vr == "TM":
                 if opts["time_clear"] and elem.value not in (None, ""):
+                    old = str(elem.value)
                     elem.value = ""
+                    _audit_add(audit, elem, "time_clear", old, "")
             elif vr in ("DA", "DT"):
                 if opts["date_month"]:
                     new = _trunc_datetime(elem.value) if vr == "DT" else _trunc_date(elem.value)
                     if new != elem.value:
+                        old = str(elem.value)
                         elem.value = new
+                        _audit_add(audit, elem, "date_month", old, new)
 
         if is_seq:
             try:
@@ -395,24 +470,28 @@ def _deep_walk(ds, rules_map, recursive_map, opts):
                 items = []
             for item in items:
                 if hasattr(item, "data_element"):
-                    _deep_walk(item, recursive_map, recursive_map, opts)
+                    n_private += _deep_walk(item, recursive_map, recursive_map, opts, audit)
             continue
 
         if opts["purge_private"] and elem.is_private:
             to_delete.append(elem.tag)
+            n_private += 1
 
     for t in to_delete:
         try:
             del ds[t]
         except KeyError:
             pass
+    return n_private
 
 
-def desensitize_dataset(ds, rules, opts):
+def desensitize_dataset(ds, rules, opts, audit=None):
     """就地脱敏一个 DICOM Dataset（模块①，按配置的规则执行）。
 
     保留 StudyInstanceUID / SeriesInstanceUID / SOPInstanceUID 等关联 UID 不变
     （除非用户显式对它们配置了规则），确保脱敏后仍是一套完整、可正常浏览的检查。
+
+    传入 audit 列表时，逐字段记录脱敏前后对比（供脱敏审计日志）。
     """
     rules_map = {}
     recursive_map = {}
@@ -424,7 +503,14 @@ def desensitize_dataset(ds, rules, opts):
             rules_map[tag] = r
         if r.get("recursive") and tag not in recursive_map:
             recursive_map[tag] = r
-    _deep_walk(ds, rules_map, recursive_map, opts)
+    n_private = _deep_walk(ds, rules_map, recursive_map, opts, audit)
+    # 私有标签数量多且无业务含义，逐个记录会让日志爆掉，这里在每个影像上汇总成一条
+    if audit is not None and n_private:
+        audit.append({
+            "tag": "(私有标签)", "keyword": "", "vr": "",
+            "method": _DESENS_METHOD_LABEL.get("clear_private", "清空私有标签"),
+            "before": "(已批量删除)", "after": "共 %d 个" % n_private,
+        })
     return ds
 
 
@@ -638,6 +724,21 @@ def _local_ips():
     return ips
 
 
+def _record_failed_file(study_key, sop_uid, reason):
+    """记录一个「处理失败、未落盘」的文件（并发安全），供统计与失败清单 CSV 使用。
+
+    只在解析/脱敏等异常导致文件被拒绝落盘时调用；命中过滤主动丢弃的不算失败。
+    """
+    with _store_lock:
+        _store_failed[study_key] = _store_failed.get(study_key, 0) + 1
+        _store_failed_files.append({
+            "study_uid": study_key,
+            "sop_uid": sop_uid,
+            "reason": reason,
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+        })
+
+
 def handle_store(event):
     """处理 C-STORE：可选「过滤 + 脱敏」后保存到对应子目录（并发安全）。
 
@@ -651,6 +752,9 @@ def handle_store(event):
     命中过滤且关闭「保存命中的过滤影像」时，文件直接丢弃不落盘（仍回成功状态，
     避免前置机把该子操作记为失败）。
     """
+    # 预置失败标识：异常若发生在解析早期（取不到 SOP/Study 之前），仍能记录来源
+    sop_uid = "?"
+    suid_key = "_unknown"
     try:
         ds = event.dataset
         ds.file_meta = event.file_meta
@@ -686,10 +790,13 @@ def handle_store(event):
         raw_patient_id = getattr(ds, "PatientID", None)
 
         # 模块①：标签脱敏（就地修改，落盘即为脱敏后影像）
+        audit_rows = []
         if _desens_enabled:
             try:
-                desensitize_dataset(ds, _desens_rules, _desens_opts)
+                desensitize_dataset(ds, _desens_rules, _desens_opts, audit_rows)
             except Exception as e:
+                reason = "脱敏失败：%s" % (str(e) or type(e).__name__)
+                _record_failed_file(suid_key, sop_uid, reason)
                 _ui_queue.put(("log", "[脱敏] 处理失败，已拒绝落盘以免泄露原始影像：SOP=%s %s" % (sop_uid, e)))
                 return 0xC000
 
@@ -722,6 +829,11 @@ def handle_store(event):
             else:
                 _store_dirs[suid_key] = d
             n_recv = _store_received[suid_key]
+        # 脱敏审计：仅在文件真正落盘后记录（未落盘的文件不入审计表），
+        # 主键为影像保存的文件名，并带上脱敏后的 PatientID
+        if audit_rows:
+            _append_desens_audit(os.path.basename(path), suid_key,
+                                 getattr(ds, "PatientID", None), audit_rows)
         # 限速：按实际落盘文件大小节流，压低下行速率
         try:
             _throttle(os.path.getsize(path))
@@ -736,7 +848,9 @@ def handle_store(event):
             pass
         return 0x0000  # Success
     except Exception as e:
-        _ui_queue.put(("log", "[StoreSCP] 保存 DICOM 失败：%s" % e))
+        reason = "%s：%s" % (type(e).__name__, str(e) or "(无详细信息)")
+        _record_failed_file(suid_key, sop_uid, reason)
+        _ui_queue.put(("log", "[StoreSCP] 保存 DICOM 失败，已拒绝落盘：SOP=%s %s" % (sop_uid, reason)))
         return 0xC000  # Unable to process，避免单文件失败中断接收
 
 
@@ -1201,7 +1315,9 @@ def pull_one_study(assoc, study_uid, local_aet):
     - 接收数 _store_received：成功处理（落盘 + 按规则丢弃）——用于进度与成功判定；
     - 落盘数 _store_counts：真正写到磁盘的文件数——用于报告与目录展示；
     - 丢弃数 _store_discarded：命中过滤且关闭「保存命中的过滤影像」的文件数。
+    - 失败数 _store_failed：解析/脱敏异常被拒绝落盘的文件数（不计入接收数，明细写失败清单）。
     若某检查全部命中过滤且被丢弃，落盘数为 0 但接收数 > 0，仍判定为成功（不误报失败）。
+    失败数单独统计：个别文件失败不影响该检查判成功，但会在日志/报告里注明。
 
     C-Move 进行中（Pending 状态）会实时用「已完成 + 失败 + 警告」估算前置机已确定的子操作数，
     累计取最大值（避免某些前置机实现不规范导致分母倒退），并立即更新全局 _current_expected_images，
@@ -1297,9 +1413,12 @@ def pull_one_study(assoc, study_uid, local_aet):
         n_saved = _store_counts.get(study_uid, 0)
         n_filtered = _store_filtered.get(study_uid, 0)
         n_discarded = _store_discarded.get(study_uid, 0)
+        n_unparsed = _store_failed.get(study_uid, 0)
     _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件%s" % (
         final_code, _status_text(final_code), n_saved,
         ("（另有 %d 个命中过滤已丢弃）" % n_discarded) if n_discarded else "")))
+    if n_unparsed:
+        _ui_queue.put(("log", "      [异常] 本检查有 %d 个文件处理失败未落盘（已记入失败清单）" % n_unparsed))
     # n_total 兜底：取 (接收数 + 已失败 + 已警告)、(累计最大预期值)、(接收数) 三者最大
     # 防止前置机"剩余=0 但还在异步推"导致最终分母小于实际收到的影像数
     n_total = max(n_received + n_failed + n_warned, expected_total_max, n_received)
@@ -1308,7 +1427,7 @@ def pull_one_study(assoc, study_uid, local_aet):
             _ui_queue.put(("log", "      [过滤] 本检查命中剂量报告/截屏规则 %d 个文件，其中 %d 个已按设置丢弃" % (n_filtered, n_discarded)))
         else:
             _ui_queue.put(("log", "      [过滤] 本检查命中剂量报告/截屏规则 %d 个文件，已存入 %s/" % (n_filtered, _FILTERED_SUBDIR)))
-    return has_error, final_code, n_saved, n_discarded, real_dir, n_failed, n_warned, n_total, n_filtered
+    return has_error, final_code, n_saved, n_discarded, real_dir, n_failed, n_warned, n_total, n_filtered, n_unparsed
 
 
 # ---------------------------------------------------------------------------
@@ -1461,6 +1580,143 @@ def _write_report_csv(records, out_root):
         return None
 
 
+_FAILED_CSV_HEADER = ["StudyInstanceUID", "SOPInstanceUID", "失败原因", "时间"]
+
+
+def _snapshot_failed_files():
+    """取「处理失败、未落盘」文件明细的快照（线程安全）。"""
+    with _store_lock:
+        return list(_store_failed_files)
+
+
+def _write_failed_csv(items, out_root):
+    """把「处理失败、未落盘」的文件清单写入输出目录下的 CSV，返回路径；无内容时返回 None。
+
+    这些文件在接收时就因解析/脱敏异常被拒绝落盘（不会写出未处理的原始影像），
+    单独留一份清单便于事后核对与补拉。
+    """
+    if not out_root or not items:
+        return None
+    try:
+        os.makedirs(out_root, exist_ok=True)
+    except Exception:
+        return None
+    csv_path = os.path.join(out_root, "未落盘文件清单_%s.csv" % time.strftime("%Y%m%d_%H%M%S"))
+    try:
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(_FAILED_CSV_HEADER)
+            for it in items:
+                w.writerow([it["study_uid"], it["sop_uid"], it["reason"], it["time"]])
+        return csv_path
+    except Exception as e:
+        _ui_queue.put(("log", "[报告] 写入未落盘文件清单失败：%s" % e))
+        return None
+
+
+def _audit_header():
+    """审计表的表头：固定列 + 每个配置规则字段一列 + 其它变更 + 时间。"""
+    return (_DESENS_AUDIT_FIXED_HEAD
+            + [tag_display(t) for t in _desens_audit_fields]
+            + _DESENS_AUDIT_TAIL_HEAD)
+
+
+def _format_other_changes(items):
+    """把「非规则字段」的变更（全局日期/时间、私有标签）汇总成一个单元格。"""
+    parts = []
+    for c in items:
+        if c["tag"] == "(私有标签)":
+            parts.append("私有标签：%s" % c["after"])
+        else:
+            parts.append("%s：%s → %s" % (c["keyword"] or c["tag"], c["before"], c["after"]))
+    return "；".join(parts)
+
+
+def _build_audit_row(file_name, study_uid, pid_after, changes, now):
+    """把一次脱敏的字段变更整理成「一个影像一行」的审计记录。
+
+    配置了规则的字段按列对齐（未变更则该格为空），其余变更汇总进「其它变更」列。
+    """
+    field_set = set(_desens_audit_fields)
+    by_tag = {}
+    others = []
+    for c in changes or []:
+        if c["tag"] in field_set and c["tag"] not in by_tag:
+            by_tag[c["tag"]] = "%s → %s" % (c["before"], c["after"])
+        else:
+            others.append(c)
+    row = [file_name, study_uid, "" if pid_after is None else str(pid_after)]
+    row += [by_tag.get(t, "") for t in _desens_audit_fields]
+    row += [_format_other_changes(others), now]
+    return row
+
+
+def _append_desens_audit(file_name, study_uid, patient_id_after, changes):
+    """把一个影像的审计记录（一行）追加到缓冲，攒够阈值即刷进临时 CSV。"""
+    row = _build_audit_row(file_name, study_uid, patient_id_after, changes,
+                           time.strftime("%Y-%m-%d %H:%M:%S"))
+    with _desens_audit_lock:
+        _desens_audit_rows.append(row)
+        if len(_desens_audit_rows) >= _DESENS_AUDIT_FLUSH:
+            _flush_desens_audit()
+
+
+def _flush_desens_audit():
+    """把审计缓冲刷入临时 CSV（调用方需已持有 _desens_audit_lock）。"""
+    global _desens_audit_rows, _desens_audit_header
+    if not _desens_audit_rows or not _desens_audit_csv:
+        _desens_audit_rows = []
+        return
+    try:
+        with open(_desens_audit_csv, "a", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            if not _desens_audit_header:
+                w.writerow(_audit_header())
+                _desens_audit_header = True
+            w.writerows(_desens_audit_rows)
+    except Exception as e:
+        _ui_queue.put(("log", "[审计] 写入脱敏审计明细失败：%s" % e))
+    _desens_audit_rows = []
+
+
+def _finalize_desens_audit(out_root):
+    """把脱敏审计明细转成 Excel，返回 xlsx 路径；无内容时返回 None。
+
+    几十万行的大表用 write_only 模式流式写入，避免一次性占满内存；
+    转换失败时保留临时 CSV，确保审计数据不丢。
+    """
+    global _desens_audit_csv, _desens_audit_header
+    with _desens_audit_lock:
+        _flush_desens_audit()
+        csv_path = _desens_audit_csv
+        _desens_audit_csv = ""
+        _desens_audit_header = False
+    if not csv_path or not os.path.exists(csv_path):
+        return None
+    xlsx_path = os.path.join(out_root, "脱敏审计_%s.xlsx" % time.strftime("%Y%m%d_%H%M%S"))
+    n_rows = 0
+    _ui_queue.put(("log", "[审计] 正在生成脱敏审计 Excel（大表可能需要几秒）..."))
+    try:
+        from openpyxl import Workbook
+        wb = Workbook(write_only=True)
+        ws = wb.create_sheet("脱敏审计")
+        with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+            for row in csv.reader(f):
+                ws.append(row)
+                n_rows += 1
+        wb.save(xlsx_path)
+        wb.close()
+    except Exception as e:
+        _ui_queue.put(("log", "[审计] 生成 Excel 失败，明细保留为 CSV：%s（%s）" % (csv_path, e)))
+        return None
+    try:
+        os.remove(csv_path)   # 转换成功即删除临时 CSV，避免同一份敏感明细留两份
+    except Exception:
+        pass
+    _ui_queue.put(("log", "[审计] 脱敏审计 Excel 已生成：%s（%d 行字段变更）" % (xlsx_path, max(0, n_rows - 1))))
+    return xlsx_path
+
+
 def _download_one(cfg, key, label, uid, idx, total):
     """下载单个 Study（不重试）。返回 (idx, status, 落盘文件数, message)。"""
     global _current_label, _current_study_uid, _current_expected_images
@@ -1475,6 +1731,7 @@ def _download_one(cfg, key, label, uid, idx, total):
         _store_dirs.clear()
         _store_filtered_dirs.clear()
         _store_filtered.clear()
+        _store_failed.clear()
 
     # 停止优先：停止后剩余任务统一记为“停止”
     if _stop_event.is_set():
@@ -1491,7 +1748,7 @@ def _download_one(cfg, key, label, uid, idx, total):
     assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
     if assoc and assoc.is_established:
         try:
-            has_error, code, n_saved, n_discarded, subdir, n_failed, n_warned, n_total, n_filtered = pull_one_study(assoc, uid, cfg.local_aet)
+            has_error, code, n_saved, n_discarded, subdir, n_failed, n_warned, n_total, n_filtered, n_unparsed = pull_one_study(assoc, uid, cfg.local_aet)
             n_recv = n_saved + n_discarded
             _current_expected_images = n_total
             _ui_queue.put(("image_progress", (label, n_recv, n_total)))
@@ -1510,17 +1767,23 @@ def _download_one(cfg, key, label, uid, idx, total):
                 filter_hint = "，其中 %d 个命中过滤存入 %s/" % (n_filtered, _FILTERED_SUBDIR)
         else:
             filter_hint = ""
+        # 处理失败（解析/脱敏异常被拒绝落盘）单独提示；少数文件失败不影响该检查整体判成功
+        fail_hint = "，%d 个文件处理失败未落盘" % n_unparsed if n_unparsed else ""
+        hint = filter_hint + fail_hint
         # 成功判定用「接收数」：某检查全部命中过滤且被丢弃时落盘为 0，但仍算成功
         if not has_error and n_recv > 0:
             # 状态码 0x0000 且无子操作失败/警告：完全成功
             if n_failed == 0 and n_warned == 0 and code == 0x0000:
-                _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s %s" % (idx, total, label, n_saved, filter_hint, dir_hint)))
-                return _success(n_saved, filter_hint.lstrip("，"))
+                _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s %s" % (idx, total, label, n_saved, hint, dir_hint)))
+                return _success(n_saved, hint.lstrip("，"))
             # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
-            _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_saved, filter_hint, n_failed, n_warned, dir_hint)))
-            return _success(n_saved, "子操作 %d 失败/%d 警告%s" % (n_failed, n_warned, filter_hint))
+            _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_saved, hint, n_failed, n_warned, dir_hint)))
+            return _success(n_saved, "子操作 %d 失败/%d 警告%s" % (n_failed, n_warned, hint))
         elif has_error:
             fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_saved)
+        elif n_unparsed:
+            # 有文件推来了但全部处理失败：直接说明原因，避免误导为「前置机没推」
+            fail_msg = "本检查 %d 个文件全部处理失败、未落盘（解析或脱敏异常，详见失败清单 CSV）" % n_unparsed
         else:
             # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
             ips = "、".join(_local_ips()) or "未知"
@@ -1553,6 +1816,13 @@ def batch_download(cfg):
         _abort_active_assocs()
         records = _snapshot_records()
         csv_path = _write_report_csv(records, cfg.out_dir) if records else None
+        # 处理失败（未落盘）的文件单独出一份清单，便于核对与补拉
+        failed_items = _snapshot_failed_files()
+        failed_csv = _write_failed_csv(failed_items, cfg.out_dir)
+        if failed_items:
+            _ui_queue.put(("log", "[报告] 本次共 %d 个文件处理失败未落盘，清单：%s" % (len(failed_items), failed_csv)))
+        # 脱敏审计明细 → Excel（仅开启模块①时才有内容；无内容则不生成文件）
+        _finalize_desens_audit(cfg.out_dir)
         _ui_queue.put(("report", (records, csv_path)))
         _ui_queue.put(("reset", None))
 
@@ -1562,9 +1832,18 @@ def _batch_download_inner(cfg):
     global _rate_last_time, _rate_tokens, _download_start_time, _throttle_cap_logged
     global _desens_enabled, _desens_rules, _desens_opts
     global _filter_enabled, _filter_rules, _filter_save_hit
+    global _desens_audit_rows, _desens_audit_csv, _desens_audit_header
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
+    with _store_lock:
+        _store_failed.clear()
+        _store_failed_files.clear()   # 失败明细按本次下载重新累积
+    # 脱敏审计按本次下载重新累积（临时 CSV 与表头状态一并复位）
+    with _desens_audit_lock:
+        _desens_audit_rows = []
+        _desens_audit_header = False
+        _desens_audit_csv = ""
 
     OUTPUT_ROOT = cfg.out_dir
     _download_start_time = time.time()  # 记录本次下载开始时间
@@ -1597,6 +1876,10 @@ def _batch_download_inner(cfg):
                 "（含序列内）" if r["recursive"] else ""))
         if not _desens_rules:
             _ui_queue.put(("log", "[脱敏] 未配置任何标签规则，仅按全局选项处理"))
+        # 脱敏审计：开启模块①即自动生成（明细先落临时 CSV，下载结束转成 Excel）
+        with _desens_audit_lock:
+            _desens_audit_csv = os.path.join(cfg.out_dir, "_脱敏审计明细.tmp.csv")
+        _ui_queue.put(("log", "[审计] 已开启脱敏审计：本次将逐字段记录脱敏前后对比，结束时生成 Excel"))
     if _filter_enabled:
         if _filter_save_hit:
             _ui_queue.put(("log", "已启用模块②：剂量报告/截屏过滤（%d 条规则；命中项存入 %s/ 子目录）" % (
@@ -1698,11 +1981,14 @@ def _batch_download_inner(cfg):
             _ui_queue.put(("status", "继续下载..."))
             _ui_queue.put(("log", "  [间隙] 暂停结束，继续下载"))
 
+    # 处理失败（未落盘）的影像总数：不影响检查成功判定，但要在汇总里明确告知
+    n_failed_files = len(_snapshot_failed_files())
+    fail_note = "（另有 %d 个影像处理失败未落盘，详见失败清单 CSV）" % n_failed_files if n_failed_files else ""
     if _stop_event.is_set():
-        _ui_queue.put(("done", "已停止：成功 %d / 失败 %d / 共 %d（剩余任务未处理）" % (ok, fail, total)))
-        _ui_queue.put(("log", "已停止：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
+        _ui_queue.put(("done", "已停止：成功 %d / 失败 %d / 共 %d%s（剩余任务未处理）" % (ok, fail, total, fail_note)))
+        _ui_queue.put(("log", "已停止：成功 %d / 失败 %d / 共 %d%s" % (ok, fail, total, fail_note)))
     else:
-        _ui_queue.put(("done", "下载完成：成功 %d / 失败 %d / 共 %d" % (ok, fail, total)))
+        _ui_queue.put(("done", "下载完成：成功 %d / 失败 %d / 共 %d%s" % (ok, fail, total, fail_note)))
 
 
 # ---------------------------------------------------------------------------
