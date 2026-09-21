@@ -14,14 +14,17 @@ DICOM 影像批量下载工具（可视化版）
 """
 
 import csv
+import hashlib
 import json
 import os
 import queue
+import re
 import socket
 import sys
 import threading
 import time
 import traceback
+from datetime import datetime
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
@@ -64,10 +67,20 @@ _current_expected_images = 0   # 前置机报告的预期影像数（用于显�
 # 按 Study 精确统计本批次落盘情况：同一病人多个检查共用一个 PatientID 目录时，
 # 不能按目录计数（会把上一个检查的文件算进来），必须按影像自带的 StudyInstanceUID 计数
 _store_lock = threading.Lock()
-_store_counts = {}             # study_uid -> 本批次已保存文件数
-_store_dirs = {}               # study_uid -> 实际保存目录
+_store_received = {}           # study_uid -> 本批次已成功处理（落盘或按规则丢弃）的文件数
+_store_counts = {}             # study_uid -> 本批次实际落盘文件数（含过滤命中的子目录文件）
+_store_dirs = {}               # study_uid -> 正常影像保存目录（原始 PatientID 命名）
+_store_filtered_dirs = {}      # study_uid -> 过滤命中影像保存目录（_剂量报告/原始 PatientID）
+_store_filtered = {}           # study_uid -> 其中命中过滤规则的文件数
+_store_discarded = {}          # study_uid -> 其中按「不保存」开关被丢弃的文件数
 _download_start_time = 0.0     # 本次批量下载的开始时间戳（用于"已耗时"）
 _diag_log = False              # 诊断日志开关：PDU/协商/Pending 细节默认隐藏，排查时打开
+_desens_enabled = False        # 模块① 标签脱敏开关（下载开始时由配置设置）
+_desens_rules = []             # 模块① 已解析的标签脱敏规则（tag 为 (group, element)）
+_desens_opts = {"purge_private": True, "date_month": True, "time_clear": True}
+_filter_enabled = False        # 模块② 剂量报告/截屏过滤开关（下载开始时由配置设置）
+_filter_rules = []             # 模块② 已解析的过滤规则
+_filter_save_hit = True        # 命中的过滤影像是否保存（False = 直接丢弃不落盘）
 # 反向探测状态：检测连通时发空 C-Move，观察前置机是否主动连入本机接收服务
 _probe_active = False
 _probe_conn_event = threading.Event()
@@ -95,6 +108,381 @@ def get_app_dir():
 
 
 CONFIG_PATH = os.path.join(get_app_dir(), "config.json")
+
+
+# ---------------------------------------------------------------------------
+# 0) 脱敏 / 过滤规则（可在「脱敏配置」界面维护，随 config.json 保存/加载）
+#    在 C-STORE 接收时直接处理内存中的 Dataset，写出的就是脱敏后的影像，
+#    省掉了"下载后再回读 + 重写"那轮磁盘 I/O。
+#    执行顺序固定为「先过滤、后脱敏」：过滤可能依赖 SeriesDescription 这类
+#    会被脱敏清空的字段，顺序反了就永远匹配不到。
+# ---------------------------------------------------------------------------
+_FILTERED_SUBDIR = "_剂量报告"   # 模块②命中的影像落到输出目录下该子目录
+
+# 标签脱敏方法：(内部键, 界面显示名, 参数说明)
+_DESENS_METHODS = [
+    ("hash",       "哈希（SHA512 截断）",     "截断位数，默认 16"),
+    ("replace",    "固定值替换",              "替换为（留空 = 置空）"),
+    ("clear",      "清空该标签",              "（无参数）"),
+    ("remove",     "删除该标签",              "（无参数）"),
+    ("birth_year", "出生日期 → 年 + 0101",    "（无参数）"),
+    ("date_month", "日期 → 年-月-01 (DA/DT)", "（无参数）"),
+    ("time_clear", "时间清空 (TM)",           "（无参数）"),
+]
+_DESENS_METHOD_LABEL = {k: v for k, v, _h in _DESENS_METHODS}
+_DESENS_METHOD_HINT = {k: h for k, _v, h in _DESENS_METHODS}
+_DESENS_PARAM_METHODS = {"hash", "replace"}   # 需要填写参数的方法
+
+# 过滤匹配模式
+_FILTER_MODES = [
+    ("exact",    "精确匹配"),
+    ("contains", "包含匹配"),
+    ("regex",    "正则匹配"),
+]
+_FILTER_MODE_LABEL = {k: v for k, v in _FILTER_MODES}
+
+# 常用标签预设（下拉可直接选，也可手动输入关键字或 Tag 号）
+_COMMON_TAGS = [
+    "PatientName", "PatientID", "PatientBirthDate", "PatientSex", "PatientAge",
+    "PatientAddress", "PatientTelephoneNumbers", "OtherPatientIDs",
+    "AccessionNumber", "StudyID", "StudyDescription", "SeriesDescription",
+    "InstitutionName", "InstitutionAddress", "InstitutionalDepartmentName",
+    "StationName", "ReferringPhysicianName", "OperatorsName", "RequestingPhysician",
+    "ScheduledProcedureStepID", "PerformedProcedureStepID",
+    "ImageType", "Modality", "BodyPartExamined",
+    "StudyDate", "SeriesDate", "AcquisitionDate",
+    "StudyTime", "SeriesTime", "AcquisitionTime",
+]
+
+# 默认规则：与既有脱敏程序的默认行为一致（不改配置时行为不变）
+_DEFAULT_DESENS_RULES = [
+    {"tag": "0008,0050", "method": "hash",       "param": "16", "recursive": False},  # AccessionNumber
+    {"tag": "0010,0020", "method": "hash",       "param": "16", "recursive": True},   # PatientID
+    {"tag": "0040,0009", "method": "hash",       "param": "16", "recursive": True},   # ScheduledProcedureStepID
+    {"tag": "0040,0253", "method": "hash",       "param": "16", "recursive": True},   # PerformedProcedureStepID
+    {"tag": "0020,0010", "method": "hash",       "param": "16", "recursive": True},   # StudyID
+    {"tag": "0010,0030", "method": "birth_year", "param": "",   "recursive": False},  # PatientBirthDate
+    {"tag": "0010,0010", "method": "replace",    "param": "ANONYMOUS",                  "recursive": False},
+    {"tag": "0008,0080", "method": "replace",    "param": "Shandong_Class3B_2_Hospital", "recursive": False},
+    {"tag": "0008,0081", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0008,0090", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0008,1070", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0032,1032", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0010,1000", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0010,1040", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0010,2154", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0008,1040", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0008,1010", "method": "replace",    "param": "",   "recursive": False},
+    {"tag": "0008,1030", "method": "replace",    "param": "",   "recursive": False},  # StudyDescription
+]
+
+_DEFAULT_FILTER_RULES = [
+    {"tag": "0008,0008", "mode": "exact",
+     "values": ["SCREEN SAVE", "SCREENSAVE"]},                                       # ImageType
+    {"tag": "0008,103E", "mode": "exact",
+     "values": ["DoseReport", "Dose Report", "BBS_Display", "BPM_Display"]},         # SeriesDescription
+]
+
+
+def tag_to_str(tag):
+    """把 (group, element) 转成 "GGGG,EEEE" 字符串。"""
+    try:
+        return "%04X,%04X" % (int(tag[0]), int(tag[1]))
+    except Exception:
+        return ""
+
+
+def parse_tag(text):
+    """解析用户输入的标签为 (group, element)，供脱敏/过滤规则使用。
+
+    支持：关键字（PatientName）、Tag 号（"0010,0020" / "(0010,0020)" / "0010 0020"）。
+    无法识别时抛 ValueError，由界面提示用户。
+    """
+    s = str(text or "").strip()
+    if not s:
+        raise ValueError("标签不能为空")
+    try:
+        from pydicom.datadict import tag_for_keyword
+        t = tag_for_keyword(s)
+    except Exception:
+        t = None
+    if t is not None:
+        return (int(t) >> 16, int(t) & 0xFFFF)
+    m = re.match(r"^\(?\s*([0-9A-Fa-f]{4})\s*[,;\s]\s*([0-9A-Fa-f]{4})\s*\)?$", s)
+    if m:
+        return (int(m.group(1), 16), int(m.group(2), 16))
+    raise ValueError("无法识别的标签：%s\n可输入关键字（如 PatientName）或 Tag 号（如 0010,0020）" % s)
+
+
+def tag_display(text):
+    """把标签渲染成 "PatientID (0010,0020)" 便于阅读。"""
+    try:
+        g, e = parse_tag(text)
+    except Exception:
+        return str(text or "")
+    code = "%04X,%04X" % (g, e)
+    try:
+        from pydicom.datadict import keyword_for_tag
+        kw = keyword_for_tag((g << 16) | e) or ""
+    except Exception:
+        kw = ""
+    return ("%s (%s)" % (kw, code)) if kw else code
+
+
+def prepare_desens_rules(raw_rules):
+    """把配置里的标签脱敏规则解析成可执行规则（附加 _tag 元组）。"""
+    out = []
+    seen = set()
+    for r in raw_rules or []:
+        try:
+            tag = parse_tag(r.get("tag"))
+        except Exception:
+            continue
+        if tag in seen:
+            continue          # 同一标签只取第一条，避免两条规则互相覆盖
+        seen.add(tag)
+        out.append({
+            "tag": tag,
+            "method": r.get("method", "clear"),
+            "param": r.get("param", ""),
+            "recursive": bool(r.get("recursive")),
+        })
+    return out
+
+
+def prepare_filter_rules(raw_rules):
+    """把配置里的过滤规则解析成可执行规则（附加 _tag 元组、values 列表）。"""
+    out = []
+    for r in raw_rules or []:
+        try:
+            tag = parse_tag(r.get("tag"))
+        except Exception:
+            continue
+        vals = r.get("values") or []
+        if isinstance(vals, str):
+            vals = [v for v in re.split(r"[;\n]", vals) if v.strip()]
+        vals = [str(v) for v in vals if str(v).strip()]
+        if not vals:
+            continue
+        out.append({"tag": tag, "mode": r.get("mode", "exact"), "values": vals})
+    return out
+
+
+def _sha512_trunc(value, n=16):
+    """SHA512 截断哈希；空值返回空串。"""
+    if value is None:
+        return ""
+    raw = str(value).strip()
+    if not raw:
+        return ""
+    return hashlib.sha512(raw.encode("utf-8")).hexdigest()[:n]
+
+
+def _mk_ym01(y, m):
+    """把年/月拼成 YYYYMM01；非法日期返回空串。"""
+    if not (y and m):
+        return ""
+    try:
+        datetime(int(y), int(m), 1)
+    except ValueError:
+        return ""
+    return y + m + "01"
+
+
+def _trunc_date(val):
+    """DA 压缩为「年-月-01」。"""
+    s = str(val or "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return _mk_ym01(s[:4], s[4:6])
+    if len(s) >= 6 and s[:6].isdigit():
+        return _mk_ym01(s[:6][:4], s[:6][4:])
+    return ""
+
+
+def _trunc_datetime(val):
+    """DT 压缩为「年-月-01」。"""
+    s = str(val or "").strip()
+    if len(s) >= 8 and s[:8].isdigit():
+        return _mk_ym01(s[:4], s[4:6])
+    return ""
+
+
+def _is_sequence(v):
+    """判断元素值是否为序列（pydicom 的 Sequence/MultiValue 不一定继承 list）。"""
+    if isinstance(v, (list, tuple)):
+        return True
+    if type(v).__name__ == "Sequence":
+        return True
+    try:
+        if len(v) == 0:
+            return True
+        return hasattr(next(iter(v)), "data_element")
+    except Exception:
+        return False
+
+
+def _apply_one_rule(elem, rule):
+    """对单个元素套用一条标签脱敏规则。返回 True 表示该标签应被删除。"""
+    method = rule.get("method")
+    if method == "remove":
+        return True
+    if method == "hash":
+        try:
+            n = int(rule.get("param") or 16)
+        except Exception:
+            n = 16
+        n = max(1, min(n, 128))
+        old = elem.value
+        new = _sha512_trunc(old, n)
+        if new and new != str(old).strip():
+            elem.value = new
+    elif method == "replace":
+        rep = rule.get("param", "")
+        rep = "" if rep is None else str(rep)
+        if str(elem.value).strip() != rep:
+            elem.value = rep
+    elif method == "clear":
+        if str(elem.value or "").strip() != "":
+            elem.value = ""
+    elif method == "birth_year":
+        raw = str(elem.value or "").strip()
+        if len(raw) >= 4:
+            elem.value = raw[:4] + "0101"
+    elif method == "date_month":
+        vr = elem.VR
+        new = _trunc_datetime(elem.value) if vr == "DT" else _trunc_date(elem.value)
+        if new != elem.value:
+            elem.value = new
+    elif method == "time_clear":
+        if elem.VR == "TM" and elem.value not in (None, ""):
+            elem.value = ""
+    return False
+
+
+def _deep_walk(ds, rules_map, recursive_map, opts):
+    """递归套用脱敏规则。
+
+    - rules_map：标签 -> 规则（顶层与递归规则都在内），命中即套用并跳过 VR 通用处理；
+    - recursive_map：只含「作用于序列内」的规则，递归进序列时改用它；
+    - opts：全局开关（清空私有标签 / 日期压缩到月 / 时间清空），对所有层级生效。
+    """
+    to_delete = []
+    for elem in list(ds):
+        tag = (elem.tag.group, elem.tag.element)
+        vr = elem.VR
+        is_seq = (vr == "SQ") or _is_sequence(elem.value)
+
+        rule = rules_map.get(tag)
+        if rule is not None and not is_seq:
+            if _apply_one_rule(elem, rule):
+                to_delete.append(elem.tag)
+            continue
+
+        if not is_seq:
+            if vr == "TM":
+                if opts["time_clear"] and elem.value not in (None, ""):
+                    elem.value = ""
+            elif vr in ("DA", "DT"):
+                if opts["date_month"]:
+                    new = _trunc_datetime(elem.value) if vr == "DT" else _trunc_date(elem.value)
+                    if new != elem.value:
+                        elem.value = new
+
+        if is_seq:
+            try:
+                items = list(elem.value)
+            except Exception:
+                items = []
+            for item in items:
+                if hasattr(item, "data_element"):
+                    _deep_walk(item, recursive_map, recursive_map, opts)
+            continue
+
+        if opts["purge_private"] and elem.is_private:
+            to_delete.append(elem.tag)
+
+    for t in to_delete:
+        try:
+            del ds[t]
+        except KeyError:
+            pass
+
+
+def desensitize_dataset(ds, rules, opts):
+    """就地脱敏一个 DICOM Dataset（模块①，按配置的规则执行）。
+
+    保留 StudyInstanceUID / SeriesInstanceUID / SOPInstanceUID 等关联 UID 不变
+    （除非用户显式对它们配置了规则），确保脱敏后仍是一套完整、可正常浏览的检查。
+    """
+    rules_map = {}
+    recursive_map = {}
+    for r in rules or []:
+        tag = r.get("tag")
+        if tag is None:
+            continue
+        if tag not in rules_map:
+            rules_map[tag] = r
+        if r.get("recursive") and tag not in recursive_map:
+            recursive_map[tag] = r
+    _deep_walk(ds, rules_map, recursive_map, opts)
+    return ds
+
+
+def _match_one_token(tok, values, mode):
+    """单个取值 token 与规则命中值集合比对（不区分大小写）。"""
+    t = str(tok or "").strip()
+    if not t:
+        return False
+    tl = t.lower()
+    for v in values:
+        vs = str(v).strip()
+        if not vs:
+            continue
+        if mode == "regex":
+            try:
+                if re.search(vs, t, re.IGNORECASE):
+                    return True
+            except re.error:
+                # 正则非法时退化为包含匹配，避免静默漏判
+                if vs.lower() in tl:
+                    return True
+        elif mode == "contains":
+            if vs.lower() in tl:
+                return True
+        else:  # exact
+            if tl == vs.lower():
+                return True
+    return False
+
+
+def _matches_filter_rules(ds, rules):
+    """判断影像是否命中「剂量报告/截屏」过滤规则（模块②，任一规则命中即算命中）。
+
+    多值字段（如 ImageType = "ORIGINAL\\PRIMARY\\SCREEN SAVE"）按 '\\' 切分后逐段比对。
+    """
+    for rule in rules or []:
+        tag = rule.get("tag")
+        if tag is None:
+            continue
+        try:
+            if tag not in ds:
+                continue
+            val = ds[tag].value
+        except Exception:
+            continue
+        if isinstance(val, (str, bytes)):
+            parts = [val]
+        elif hasattr(val, "__iter__"):
+            parts = list(val)
+        else:
+            parts = [val]
+        mode = rule.get("mode", "exact")
+        values = rule.get("values") or []
+        for p in parts:
+            for tok in str(p).split("\\"):
+                if _match_one_token(tok, values, mode):
+                    return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -251,23 +639,67 @@ def _local_ips():
 
 
 def handle_store(event):
-    """处理 C-STORE：把收到的 DICOM 文件保存到对应 Study 子目录（并发安全）。"""
+    """处理 C-STORE：可选「过滤 + 脱敏」后保存到对应子目录（并发安全）。
+
+    落盘前即完成过滤与脱敏，写出的就是脱敏后的影像（比"下载后再单独跑脱敏程序"
+    少一轮磁盘回读+重写）。脱敏失败时拒绝落盘，避免写入未脱敏影像。
+
+    目录名固定用「影像自带的原始 PatientID」（缺失时回落到 StudyInstanceUID），
+    与是否开启脱敏无关：即使开启了模块①，文件夹也不会变成哈希值。
+
+    顺序固定「先过滤、后脱敏」：过滤可能依赖会被脱敏清空的字段。
+    命中过滤且关闭「保存命中的过滤影像」时，文件直接丢弃不落盘（仍回成功状态，
+    避免前置机把该子操作记为失败）。
+    """
     try:
         ds = event.dataset
         ds.file_meta = event.file_meta
         sop_uid = getattr(ds, "SOPInstanceUID", None) or ("unknown-%d" % int(time.time()))
         study_uid = getattr(ds, "StudyInstanceUID", None)
+        suid_key = str(study_uid) if study_uid else "_unknown"
         # 关键防御：OUTPUT_ROOT 尚未设置或已被清空时（如程序关闭中/已停止）拒绝写入
         if not OUTPUT_ROOT:
             _ui_queue.put(("log", "[StoreSCP] 收到 DICOM 但输出目录未就绪，已拒绝：SOP=%s" % sop_uid))
             return 0xC000
-        # 统一优先用图像自带的 PatientID 作目录名（缺失时回落到 StudyInstanceUID）
-        patient_id = getattr(ds, "PatientID", None)
-        folder_key = patient_id or study_uid
+
+        # 模块②：剂量报告/截屏判断
+        # 注意：必须在脱敏之前判断——SeriesDescription 会被模块①清空，脱敏后就匹配不到了
+        is_filtered = _filter_enabled and _matches_filter_rules(ds, _filter_rules)
+
+        # 命中过滤 + 未开启「保存命中的过滤影像」→ 丢弃（不回写磁盘，但仍回成功状态）
+        if is_filtered and not _filter_save_hit:
+            with _store_lock:
+                _store_received[suid_key] = _store_received.get(suid_key, 0) + 1
+                _store_filtered[suid_key] = _store_filtered.get(suid_key, 0) + 1
+                _store_discarded[suid_key] = _store_discarded.get(suid_key, 0) + 1
+                n_recv = _store_received[suid_key]
+            try:
+                if suid_key == _current_study_uid:
+                    n_total = max(n_recv, _current_expected_images)
+                    _ui_queue.put(("image_progress", (_current_label, n_recv, n_total)))
+            except Exception:
+                pass
+            return 0x0000  # Success：已按规则丢弃，不算失败
+
+        # 目录名固定用「影像自带的原始 PatientID」（不论是否开启模块①，都不用脱敏后的哈希值），
+        # 因此必须在脱敏前先取出原始值
+        raw_patient_id = getattr(ds, "PatientID", None)
+
+        # 模块①：标签脱敏（就地修改，落盘即为脱敏后影像）
+        if _desens_enabled:
+            try:
+                desensitize_dataset(ds, _desens_rules, _desens_opts)
+            except Exception as e:
+                _ui_queue.put(("log", "[脱敏] 处理失败，已拒绝落盘以免泄露原始影像：SOP=%s %s" % (sop_uid, e)))
+                return 0xC000
+
+        # 统一用影像自带的原始 PatientID 作目录名（缺失时回落到 StudyInstanceUID）
+        folder_key = raw_patient_id or study_uid
+        base = os.path.join(OUTPUT_ROOT, _FILTERED_SUBDIR) if is_filtered else OUTPUT_ROOT
         if folder_key:
-            d = os.path.join(OUTPUT_ROOT, _safe_name(folder_key))
+            d = os.path.join(base, _safe_name(folder_key))
         else:
-            d = os.path.join(OUTPUT_ROOT, "_unknown_study")
+            d = os.path.join(base, "_unknown_study")
             _ui_queue.put(("log", "[StoreSCP] 收到缺少定位字段的文件，落入 _unknown_study/"))
         os.makedirs(d, exist_ok=True)
         path = os.path.join(d, _safe_name(sop_uid) + ".dcm")
@@ -281,11 +713,15 @@ def handle_store(event):
             ds.save_as(path, enforce_file_format=True)
         # 保存成功后才计数（并发安全）：按 Study 精确统计本批次落盘数与目录，
         # 同一病人多个检查共用 PatientID 目录时，按目录计数会把其它检查的文件算进来
-        suid_key = str(study_uid) if study_uid else "_unknown"
         with _store_lock:
+            _store_received[suid_key] = _store_received.get(suid_key, 0) + 1
             _store_counts[suid_key] = _store_counts.get(suid_key, 0) + 1
-            _store_dirs[suid_key] = d
-            n_saved = _store_counts[suid_key]
+            if is_filtered:
+                _store_filtered[suid_key] = _store_filtered.get(suid_key, 0) + 1
+                _store_filtered_dirs[suid_key] = d
+            else:
+                _store_dirs[suid_key] = d
+            n_recv = _store_received[suid_key]
         # 限速：按实际落盘文件大小节流，压低下行速率
         try:
             _throttle(os.path.getsize(path))
@@ -294,8 +730,8 @@ def handle_store(event):
         # 通知 GUI：仅当前正在下载的检查推送进度（避免上一个检查的尾部推送干扰当前进度条）
         try:
             if suid_key == _current_study_uid:
-                n_total = max(n_saved, _current_expected_images)
-                _ui_queue.put(("image_progress", (_current_label, n_saved, n_total)))
+                n_total = max(n_recv, _current_expected_images)
+                _ui_queue.put(("image_progress", (_current_label, n_recv, n_total)))
         except Exception:
             pass
         return 0x0000  # Success
@@ -755,26 +1191,32 @@ def find_studies_by_patient(assoc, patient_id):
 
 
 def pull_one_study(assoc, study_uid, local_aet):
-    """拉取一个 Study。影像保存目录由 handle_store 决定（统一按 PatientID 命名）。
+    """拉取一个 Study。影像保存目录由 handle_store 决定（统一按原始 PatientID 命名）。
 
     本函数不再预建任何目录：文件数统计/校验按 Study 精确计数（handle_store 记录到
-    _store_counts），实际落盘目录从 _store_dirs 读取，避免产生以查询键命名的空文件夹，
-    也避免同一病人多个检查共用目录时互相串数。
+    _store_received / _store_counts），实际落盘目录从 _store_dirs 读取，避免产生以查询键
+    命名的空文件夹，也避免同一病人多个检查共用目录时互相串数。
+
+    计数分三类，避免互相干扰：
+    - 接收数 _store_received：成功处理（落盘 + 按规则丢弃）——用于进度与成功判定；
+    - 落盘数 _store_counts：真正写到磁盘的文件数——用于报告与目录展示；
+    - 丢弃数 _store_discarded：命中过滤且关闭「保存命中的过滤影像」的文件数。
+    若某检查全部命中过滤且被丢弃，落盘数为 0 但接收数 > 0，仍判定为成功（不误报失败）。
 
     C-Move 进行中（Pending 状态）会实时用「已完成 + 失败 + 警告」估算前置机已确定的子操作数，
     累计取最大值（避免某些前置机实现不规范导致分母倒退），并立即更新全局 _current_expected_images，
     让 handle_store 后续发的 image_progress 也能用上新分母；前置机不报子操作计数时退化为 C-Move
-    完成后再用 n_files + n_failed + n_warned 兜底作为分母。
+    完成后再用 接收数 + n_failed + n_warned 兜底作为分母。
 
     注意：NumberOfRemainingSuboperations 在该前置机上不可信（剩余=0 但已完成还在涨），
     所以不参与估算，仅在日志中展示。
     """
     global _current_expected_images
 
-    def _n_files_now():
-        """本批次该 Study 已保存文件数（handle_store 尚未保存任何文件时为 0）。"""
+    def _n_received_now():
+        """本批次该 Study 已成功处理的文件数（落盘 + 按规则丢弃）。"""
         with _store_lock:
-            return _store_counts.get(study_uid, 0)
+            return _store_received.get(study_uid, 0)
 
     ds = Dataset()
     ds.QueryRetrieveLevel = "STUDY"
@@ -811,14 +1253,14 @@ def pull_one_study(assoc, study_uid, local_aet):
                     est_from_subops = c_val + f_val + w_val
                     # 取「子操作估算值」与「当前已落盘数」的较大者，防止前置机的"已完成"上报有延迟
                     # 时显示「分子 > 分母」；同时永不倒退
-                    n_files_now = _n_files_now()
-                    est = max(est_from_subops, n_files_now, expected_total_max)
+                    n_recv_now = _n_received_now()
+                    est = max(est_from_subops, n_recv_now, expected_total_max)
                     if est > expected_total_max:
                         expected_total_max = est
                         # 实时更新全局分母：handle_store 后续发的 image_progress 会立即用上新分母
                         _current_expected_images = est
                         # 主动推一次进度，让 UI 立即从「X / ?」变成「X / N」
-                        _ui_queue.put(("image_progress", (_current_label, n_files_now, est)))
+                        _ui_queue.put(("image_progress", (_current_label, n_recv_now, est)))
                 extra = ""
                 if remaining is not None or completed is not None:
                     extra = " (剩余=%s 已完成=%s 失败=%s 警告=%s)" % (remaining, completed, failed, warned)
@@ -837,26 +1279,36 @@ def pull_one_study(assoc, study_uid, local_aet):
         has_error = True
         _ui_queue.put(("log", "      [C-Move 异常] %s" % e))
 
-    n_files = _n_files_now()
+    n_received = _n_received_now()
     # 部分医院前置机是"先返回 C-Move 成功、再异步推送影像"，
     # 状态成功但暂时 0 文件时，最多等 30 秒观察文件是否陆续落盘
-    if not has_error and n_files == 0:
+    if not has_error and n_received == 0:
         _ui_queue.put(("log", "      [C-Move] 状态成功但暂无文件落盘，等待前置机异步推送（最多 30 秒）..."))
         for _ in range(60):
             time.sleep(0.5)
             if _stop_event.is_set():
                 break
-            n_files = _n_files_now()
-            if n_files > 0:
+            n_received = _n_received_now()
+            if n_received > 0:
                 break
-    _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件" % (final_code, _status_text(final_code), n_files)))
-    # n_total 兜底：取 (已落盘 + 已失败 + 已警告)、(累计最大预期值)、(已落盘数) 三者最大
-    # 防止前置机"剩余=0 但还在异步推"导致最终分母小于实际收到的影像数
-    n_total = max(n_files + n_failed + n_warned, expected_total_max, n_files)
-    # 返回实际落盘目录（handle_store 记录的真实目录），无文件落盘时为 None
+    # 落盘数 / 丢弃数：接收数 = 落盘数 + 丢弃数
     with _store_lock:
-        real_dir = _store_dirs.get(study_uid)
-    return has_error, final_code, n_files, real_dir, n_failed, n_warned, n_total
+        real_dir = _store_dirs.get(study_uid) or _store_filtered_dirs.get(study_uid)
+        n_saved = _store_counts.get(study_uid, 0)
+        n_filtered = _store_filtered.get(study_uid, 0)
+        n_discarded = _store_discarded.get(study_uid, 0)
+    _ui_queue.put(("log", "      [C-Move] 结束，最终状态 0x%04X %s，本地落盘 %d 个文件%s" % (
+        final_code, _status_text(final_code), n_saved,
+        ("（另有 %d 个命中过滤已丢弃）" % n_discarded) if n_discarded else "")))
+    # n_total 兜底：取 (接收数 + 已失败 + 已警告)、(累计最大预期值)、(接收数) 三者最大
+    # 防止前置机"剩余=0 但还在异步推"导致最终分母小于实际收到的影像数
+    n_total = max(n_received + n_failed + n_warned, expected_total_max, n_received)
+    if n_filtered:
+        if n_discarded:
+            _ui_queue.put(("log", "      [过滤] 本检查命中剂量报告/截屏规则 %d 个文件，其中 %d 个已按设置丢弃" % (n_filtered, n_discarded)))
+        else:
+            _ui_queue.put(("log", "      [过滤] 本检查命中剂量报告/截屏规则 %d 个文件，已存入 %s/" % (n_filtered, _FILTERED_SUBDIR)))
+    return has_error, final_code, n_saved, n_discarded, real_dir, n_failed, n_warned, n_total, n_filtered
 
 
 # ---------------------------------------------------------------------------
@@ -879,6 +1331,16 @@ class DownloadConfig:
         self.pause_seconds = 30       # 暂停秒数
         self.cmove_timeout = 300      # C-MOVE 超时（秒）
         self.cfind_timeout = 60       # C-FIND 超时（秒）
+        self.desens_enabled = False   # 模块① 标签脱敏开关：落盘即为脱敏后影像
+        self.filter_enabled = False   # 模块② 剂量报告/截屏过滤开关
+        # 模块① 规则与全局选项（在「脱敏配置」中维护）
+        self.desens_rules = [dict(r) for r in _DEFAULT_DESENS_RULES]
+        self.desens_purge_private = True   # 清空所有私有标签
+        self.desens_date_month = True      # 所有 DA/DT 统一压缩为「年-月-01」
+        self.desens_time_clear = True      # 所有 TM 统一清空
+        # 模块② 规则与命中处理方式
+        self.filter_rules = [dict(r) for r in _DEFAULT_FILTER_RULES]
+        self.filter_save_hit = True        # 命中过滤的影像是否保存（False = 丢弃不落盘）
 
 
 def _register_assoc(assoc):
@@ -1000,16 +1462,19 @@ def _write_report_csv(records, out_root):
 
 
 def _download_one(cfg, key, label, uid, idx, total):
-    """下载单个 Study（不重试）。返回 (idx, status, n_files, message)。"""
+    """下载单个 Study（不重试）。返回 (idx, status, 落盘文件数, message)。"""
     global _current_label, _current_study_uid, _current_expected_images
     _current_label = label
     _current_study_uid = str(uid)  # handle_store 据此只推当前检查的进度
     _current_expected_images = 0   # 拉取前未知，由 pull_one_study 返回值/异常时回填
     # 清空本批次计数/目录表：上一个检查的残留推送不计入当前检查
     with _store_lock:
+        _store_received.clear()
         _store_counts.clear()
+        _store_discarded.clear()
         _store_dirs.clear()
-    n_files = 0
+        _store_filtered_dirs.clear()
+        _store_filtered.clear()
 
     # 停止优先：停止后剩余任务统一记为“停止”
     if _stop_event.is_set():
@@ -1026,27 +1491,36 @@ def _download_one(cfg, key, label, uid, idx, total):
     assoc = _make_assoc(cfg, StudyRootQueryRetrieveInformationModelMove, "C-Move", "cmove_timeout", 300)
     if assoc and assoc.is_established:
         try:
-            has_error, code, n_files, subdir, n_failed, n_warned, n_total = pull_one_study(assoc, uid, cfg.local_aet)
+            has_error, code, n_saved, n_discarded, subdir, n_failed, n_warned, n_total, n_filtered = pull_one_study(assoc, uid, cfg.local_aet)
+            n_recv = n_saved + n_discarded
             _current_expected_images = n_total
-            _ui_queue.put(("image_progress", (label, n_files, n_total)))
+            _ui_queue.put(("image_progress", (label, n_recv, n_total)))
         finally:
             _unregister_assoc(assoc)
             try:
                 assoc.release()
             except Exception:
                 pass
-        # subdir 为实际落盘目录（PatientID 命名）；无文件落盘时为 None
+        # subdir 为实际落盘目录（原始 PatientID 命名）；无文件落盘时为 None
         dir_hint = subdir or "（无文件落盘）"
-        if not has_error and n_files > 0:
+        if n_filtered:
+            if n_discarded:
+                filter_hint = "，命中过滤 %d 个（丢弃 %d 个）" % (n_filtered, n_discarded)
+            else:
+                filter_hint = "，其中 %d 个命中过滤存入 %s/" % (n_filtered, _FILTERED_SUBDIR)
+        else:
+            filter_hint = ""
+        # 成功判定用「接收数」：某检查全部命中过滤且被丢弃时落盘为 0，但仍算成功
+        if not has_error and n_recv > 0:
             # 状态码 0x0000 且无子操作失败/警告：完全成功
             if n_failed == 0 and n_warned == 0 and code == 0x0000:
-                _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件 %s" % (idx, total, label, n_files, dir_hint)))
-                return _success(n_files)
+                _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s %s" % (idx, total, label, n_saved, filter_hint, dir_hint)))
+                return _success(n_saved, filter_hint.lstrip("，"))
             # 子操作有失败/警告（0xB000）：按本地已落盘文件数视为成功，接受个别失败
-            _ui_queue.put(("log", "[%d/%d] [完成] %s -> %d 个文件（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_files, n_failed, n_warned, dir_hint)))
-            return _success(n_files, "子操作 %d 失败/%d 警告" % (n_failed, n_warned))
+            _ui_queue.put(("log", "[%d/%d] [完成] %s -> 落盘 %d 个文件%s（子操作 %d 失败/%d 警告，接受） %s" % (idx, total, label, n_saved, filter_hint, n_failed, n_warned, dir_hint)))
+            return _success(n_saved, "子操作 %d 失败/%d 警告%s" % (n_failed, n_warned, filter_hint))
         elif has_error:
-            fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_files)
+            fail_msg = "状态码 0x%04X（本地文件 %d 个）" % (code, n_saved)
         else:
             # 状态码成功但 0 文件：前置机没有把影像推到本机（注册信息不符/防火墙/异步未推）
             ips = "、".join(_local_ips()) or "未知"
@@ -1057,8 +1531,8 @@ def _download_one(cfg, key, label, uid, idx, total):
     else:
         fail_msg = "连接 PACS 失败"
     _ui_queue.put(("log", "[%d/%d] [失败] %s：%s" % (idx, total, label, fail_msg)))
-    _record_download(idx, key, uid, label, "失败", n_files, fail_msg)
-    return idx, "failed", n_files, fail_msg
+    _record_download(idx, key, uid, label, "失败", n_saved, fail_msg)
+    return idx, "failed", n_saved, fail_msg
 
 
 def batch_download(cfg):
@@ -1086,6 +1560,8 @@ def batch_download(cfg):
 def _batch_download_inner(cfg):
     global OUTPUT_ROOT, _rate_limit_kbps
     global _rate_last_time, _rate_tokens, _download_start_time, _throttle_cap_logged
+    global _desens_enabled, _desens_rules, _desens_opts
+    global _filter_enabled, _filter_rules, _filter_save_hit
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
@@ -1099,6 +1575,39 @@ def _batch_download_inner(cfg):
     _throttle_cap_logged = False  # 每次下载重置，保证限速封顶提示能在每次下载时生效
     if _rate_limit_kbps > 0:
         _ui_queue.put(("log", "已启用限速：%d KB/s" % _rate_limit_kbps))
+
+    # 脱敏/过滤开关（下载开始时一次性生效，中途修改配置不影响本次任务）
+    _desens_enabled = bool(getattr(cfg, "desens_enabled", False))
+    _filter_enabled = bool(getattr(cfg, "filter_enabled", False))
+    _desens_rules = prepare_desens_rules(getattr(cfg, "desens_rules", None))
+    _desens_opts = {
+        "purge_private": bool(getattr(cfg, "desens_purge_private", True)),
+        "date_month": bool(getattr(cfg, "desens_date_month", True)),
+        "time_clear": bool(getattr(cfg, "desens_time_clear", True)),
+    }
+    _filter_rules = prepare_filter_rules(getattr(cfg, "filter_rules", None))
+    _filter_save_hit = bool(getattr(cfg, "filter_save_hit", True))
+    if _desens_enabled:
+        _ui_queue.put(("log", "已启用模块①：标签脱敏（%d 条规则；清空私有标签=%s，日期压缩到月=%s，时间清空=%s）" % (
+            len(_desens_rules), _desens_opts["purge_private"], _desens_opts["date_month"], _desens_opts["time_clear"])))
+        for r in _desens_rules:
+            _diag("      [脱敏规则] %s -> %s %s%s" % (
+                tag_display(tag_to_str(r["tag"])), _DESENS_METHOD_LABEL.get(r["method"], r["method"]),
+                ("参数=%s" % r["param"]) if r["param"] else "",
+                "（含序列内）" if r["recursive"] else ""))
+        if not _desens_rules:
+            _ui_queue.put(("log", "[脱敏] 未配置任何标签规则，仅按全局选项处理"))
+    if _filter_enabled:
+        if _filter_save_hit:
+            _ui_queue.put(("log", "已启用模块②：剂量报告/截屏过滤（%d 条规则；命中项存入 %s/ 子目录）" % (
+                len(_filter_rules), _FILTERED_SUBDIR)))
+        else:
+            _ui_queue.put(("log", "已启用模块②：剂量报告/截屏过滤（%d 条规则；命中项将直接丢弃，不落盘）" % len(_filter_rules)))
+        for r in _filter_rules:
+            _diag("      [过滤规则] %s %s %s" % (
+                tag_display(tag_to_str(r["tag"])), _FILTER_MODE_LABEL.get(r["mode"], r["mode"]), r["values"]))
+        if not _filter_rules:
+            _ui_queue.put(("log", "[过滤] 未配置任何过滤规则，本次不会过滤任何影像"))
 
     # 1) 读 Excel（得到 keys：StudyInstanceUID 或 patientId）
     _ui_queue.put(("log", "正在读取 Excel：%s" % cfg.excel_path))
@@ -1199,19 +1708,38 @@ def _batch_download_inner(cfg):
 # ---------------------------------------------------------------------------
 # 5) GUI 界面
 # ---------------------------------------------------------------------------
+def _center_on_parent(win, parent):
+    """把对话框大致居中到主窗口上方（不同平台都能落在屏幕内）。"""
+    try:
+        win.update_idletasks()
+        px, py = parent.winfo_rootx(), parent.winfo_rooty()
+        pw, ph = parent.winfo_width(), parent.winfo_height()
+        w, h = win.winfo_width(), win.winfo_height()
+        x = px + max(0, (pw - w) // 2)
+        y = py + max(0, (ph - h) // 3)
+        win.geometry("+%d+%d" % (x, y))
+    except Exception:
+        pass
+
+
 class App:
     def __init__(self, root):
         self.root = root
         root.title("DICOM 影像批量下载工具")
-        root.geometry("760x720")
-        root.minsize(720, 650)
+        root.geometry("880x900")
+        root.minsize(760, 620)
 
         self.cfg = DownloadConfig()
         self.thread = None
         self.records = []       # 最近一次下载的结果记录
         self.report_csv = None  # 最近一次下载报告 CSV 路径
+        # 规则表（界面为唯一真源；新增/编辑/删除后立即重建表格）
+        self.desens_rules = [dict(r) for r in _DEFAULT_DESENS_RULES]
+        self.filter_rules = [dict(r) for r in _DEFAULT_FILTER_RULES]
 
         self._build_widgets()
+        self._rebuild_desens_table()
+        self._rebuild_filter_table()
         self._load_config()
         self._poll_queue()
 
@@ -1219,21 +1747,42 @@ class App:
     def _build_widgets(self):
         pad = dict(padx=6, pady=3)
 
+        # 配置区（上下罗列，可滚动）：高度随内容动态变化，优先完整显示配置
+        host = ttk.Frame(self.root)
+        host.pack(fill="x", expand=False)
+        self._cfg_host = host
+        self._cfg_canvas = tk.Canvas(host, highlightthickness=0, height=200)
+        vsb = ttk.Scrollbar(host, orient="vertical", command=self._cfg_canvas.yview)
+        self._cfg_canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self._cfg_canvas.pack(side="left", fill="both", expand=True)
+        holder = ttk.Frame(self._cfg_canvas)
+        self._cfg_holder = holder
+        self._cfg_window = self._cfg_canvas.create_window((0, 0), window=holder, anchor="nw")
+        holder.bind("<Configure>", self._on_cfg_content_change)
+        self._cfg_canvas.bind("<Configure>",
+                              lambda e: self._cfg_canvas.itemconfigure(self._cfg_window, width=e.width))
+        # 鼠标滚轮仅在指针位于配置区时生效（避免抢走日志框的滚动）
+        self._cfg_canvas.bind("<Enter>", self._bind_wheel)
+        self._cfg_canvas.bind("<Leave>", self._unbind_wheel)
+        # 窗口尺寸变化时重新分配「配置区 / 日志」的高度
+        self.root.bind("<Configure>", self._sync_cfg_height)
+
         # PACS 配置
-        f1 = ttk.LabelFrame(self.root, text="PACS 前置机配置（由医院实施工程师提供）")
+        f1 = ttk.LabelFrame(holder, text="PACS 前置机配置（由医院实施工程师提供）")
         f1.pack(fill="x", padx=10, pady=(10, 4))
         self._entry_pair(f1, "PACS IP", "pacs_host", default="")
         self._entry_pair(f1, "PACS 端口", "pacs_port", default="104")
         self._entry_pair(f1, "PACS AE Title", "pacs_aet", default="")
 
         # 本机配置
-        f2 = ttk.LabelFrame(self.root, text="本机接收节点配置（需注册到 PACS 前置机）")
+        f2 = ttk.LabelFrame(holder, text="本机接收节点配置（需注册到 PACS 前置机）")
         f2.pack(fill="x", padx=10, pady=4)
         self._entry_pair(f2, "本机 AE Title", "local_aet", default="MYAET")
         self._entry_pair(f2, "本机接收端口", "local_port", default="11112")
 
         # 下载配置
-        f3 = ttk.LabelFrame(self.root, text="下载配置")
+        f3 = ttk.LabelFrame(holder, text="下载配置")
         f3.pack(fill="x", padx=10, pady=4)
 
         row0 = ttk.Frame(f3); row0.pack(fill="x", **pad)
@@ -1291,7 +1840,13 @@ class App:
         ttk.Checkbutton(row4, text="诊断日志", variable=self.var_diag_log,
                         command=self._sync_diag).pack(side="left", padx=(12, 0))
 
-        # 按钮区
+        # 脱敏配置（独立模块，与下载配置分开）
+        f4 = ttk.LabelFrame(holder, text="脱敏配置（独立模块，两个开关相互独立；开启后落盘即为处理后的影像）")
+        f4.pack(fill="x", padx=10, pady=(4, 10))
+        self._build_filter_section(f4)   # 过滤在上（执行顺序也是先过滤后脱敏）
+        self._build_desens_section(f4)
+
+        # ---- 底部固定区（按钮 / 进度 / 日志，不随配置区滚动）----
         fbtn = ttk.Frame(self.root)
         fbtn.pack(fill="x", padx=10, pady=6)
         self.btn_test = ttk.Button(fbtn, text="检测连通", command=self._test_connectivity)
@@ -1319,9 +1874,186 @@ class App:
         self.var_elapsed = tk.StringVar(value="已耗时: 00:00:00")
         ttk.Label(info_row, textvariable=self.var_elapsed).pack(side="left")
 
-        # 日志
-        self.log = scrolledtext.ScrolledText(self.root, height=16, state="disabled", wrap="word")
+        # 日志：占配置区之外的剩余空间（配置区越高，日志越小，但不小于 3 行）
+        self._log_min_height = 60
+        self.log = scrolledtext.ScrolledText(self.root, height=3, state="disabled", wrap="word")
         self.log.pack(fill="both", expand=True, padx=10, pady=(4, 10))
+        self.root.update_idletasks()
+        self._log_min_height = self.log.winfo_reqheight()
+        self._sync_cfg_height()
+
+    # ----- 配置区 / 日志 的动态高度分配 -----
+    def _on_cfg_content_change(self, _event=None):
+        """配置区内容变化（勾选展开/收起、增删规则等）时更新滚动区域并重新分配高度。"""
+        self._cfg_canvas.configure(scrollregion=self._cfg_canvas.bbox("all"))
+        self._sync_cfg_height()
+
+    @staticmethod
+    def _pack_pady(widget):
+        """返回控件的 pack 上下 pady 之和。"""
+        try:
+            p = widget.pack_info().get("pady", 0)
+        except Exception:
+            return 0
+        if isinstance(p, (tuple, list)):
+            try:
+                return int(p[0]) + int(p[-1])
+            except Exception:
+                return 0
+        try:
+            return int(p) * 2
+        except Exception:
+            return 0
+
+    def _sync_cfg_height(self, _event=None):
+        """动态分配高度：以完整显示配置区为主，剩余空间给日志。
+
+        - 配置内容短 → 画布收缩到内容高度，日志占据剩余空间（变高）；
+        - 配置内容长 → 画布尽量占满可用高度，日志收缩到最小（3 行）；
+        - 仍放不下 → 配置区内部滚动（右侧滚动条可用）。
+        """
+        holder = getattr(self, "_cfg_holder", None)
+        host = getattr(self, "_cfg_host", None)
+        log = getattr(self, "log", None)
+        if holder is None or host is None or log is None:
+            return
+        try:
+            content_h = holder.winfo_reqheight()
+        except Exception:
+            return
+        # 除配置区、日志外的固定区域（按钮/进度/状态等）高度，含上下 pady
+        reserved = 0
+        try:
+            for w in self.root.pack_slaves():
+                if w is host:
+                    continue
+                if w is log:
+                    reserved += self._pack_pady(w)   # 日志只计上下留白，高度另用 _log_min_height
+                else:
+                    reserved += w.winfo_reqheight() + self._pack_pady(w)
+        except Exception:
+            pass
+        avail = self.root.winfo_height() - reserved - getattr(self, "_log_min_height", 60)
+        avail = max(120, avail)
+        target = content_h if content_h < avail else avail
+        try:
+            self._cfg_canvas.configure(height=int(target))
+        except Exception:
+            pass
+
+    # ----- 脱敏配置区（模块①）-----
+    def _build_desens_section(self, parent):
+        f = ttk.LabelFrame(parent, text="模块① 标签脱敏（按下列规则逐条处理；未配置的标签不受影响）")
+        f.pack(fill="x", padx=6, pady=(0, 4))
+
+        top = ttk.Frame(f); top.pack(fill="x", padx=6, pady=3)
+        self.var_desens = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="启用标签脱敏", variable=self.var_desens,
+                        command=self._toggle_desens_detail).pack(side="left")
+        ttk.Label(top, text="（勾选后显示详细规则配置）", foreground="#666").pack(side="left", padx=6)
+
+        # 详细配置：仅勾选「启用标签脱敏」时显示
+        detail = ttk.Frame(f)
+        self.desens_detail = detail
+
+        opt = ttk.Frame(detail); opt.pack(fill="x", padx=6, pady=3)
+        ttk.Label(opt, text="全局选项:").pack(side="left")
+        self.var_purge_private = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="清空私有标签", variable=self.var_purge_private).pack(side="left", padx=(6, 0))
+        self.var_date_month = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="所有日期压缩到「年-月-01」", variable=self.var_date_month).pack(side="left", padx=(10, 0))
+        self.var_time_clear = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="所有时间清空", variable=self.var_time_clear).pack(side="left", padx=(10, 0))
+
+        tbl = ttk.Frame(detail); tbl.pack(fill="x", padx=6, pady=(0, 3))
+        cols = ("tag", "method", "param", "scope")
+        self.tv_desens = ttk.Treeview(tbl, columns=cols, show="headings", height=6)
+        for cid, text, w in (("tag", "DICOM 标签", 280), ("method", "脱敏方法", 180),
+                             ("param", "参数", 150), ("scope", "作用范围", 110)):
+            self.tv_desens.heading(cid, text=text)
+            self.tv_desens.column(cid, width=w, anchor="w", stretch=(cid == "param"))
+        sb = ttk.Scrollbar(tbl, orient="vertical", command=self.tv_desens.yview)
+        self.tv_desens.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tv_desens.pack(side="left", fill="x", expand=True)
+        self.tv_desens.bind("<Double-1>", lambda e: self._edit_desens_rule())
+
+        bar = ttk.Frame(detail); bar.pack(fill="x", padx=6, pady=(0, 6))
+        self.btn_desens_add = ttk.Button(bar, text="添加规则", command=self._add_desens_rule)
+        self.btn_desens_add.pack(side="left")
+        self.btn_desens_edit = ttk.Button(bar, text="编辑", command=self._edit_desens_rule)
+        self.btn_desens_edit.pack(side="left", padx=4)
+        self.btn_desens_del = ttk.Button(bar, text="删除", command=self._del_desens_rule)
+        self.btn_desens_del.pack(side="left")
+        self.btn_desens_reset = ttk.Button(bar, text="恢复默认规则", command=self._reset_desens_rules)
+        self.btn_desens_reset.pack(side="left", padx=4)
+        ttk.Label(bar, text="（双击行可编辑；同一标签只生效第一条规则）",
+                  foreground="#666").pack(side="left", padx=8)
+        self._desens_buttons = [self.btn_desens_add, self.btn_desens_edit,
+                                self.btn_desens_del, self.btn_desens_reset]
+        self._toggle_desens_detail()
+
+    def _toggle_desens_detail(self):
+        """勾选「启用标签脱敏」才展开详细规则配置。"""
+        if self.var_desens.get():
+            self.desens_detail.pack(fill="x")
+        else:
+            self.desens_detail.pack_forget()
+
+    # ----- 脱敏配置区（模块②）-----
+    def _build_filter_section(self, parent):
+        f = ttk.LabelFrame(parent, text="模块② 剂量报告/截屏过滤（任一规则命中即算命中）")
+        f.pack(fill="x", padx=6, pady=(0, 6))
+
+        top = ttk.Frame(f); top.pack(fill="x", padx=6, pady=3)
+        self.var_filter = tk.BooleanVar(value=False)
+        ttk.Checkbutton(top, text="启用剂量报告/截屏过滤", variable=self.var_filter,
+                        command=self._toggle_filter_detail).pack(side="left")
+        ttk.Label(top, text="（勾选后显示详细规则配置）", foreground="#666").pack(side="left", padx=6)
+
+        # 详细配置：仅勾选「启用剂量报告/截屏过滤」时显示
+        detail = ttk.Frame(f)
+        self.filter_detail = detail
+
+        opt = ttk.Frame(detail); opt.pack(fill="x", padx=6, pady=3)
+        self.var_filter_save_hit = tk.BooleanVar(value=True)
+        ttk.Checkbutton(opt, text="保存命中的过滤影像", variable=self.var_filter_save_hit).pack(side="left")
+        ttk.Label(opt, text="（勾选：存入 输出目录/%s/ 子目录；不勾选：直接丢弃不落盘）" % _FILTERED_SUBDIR,
+                  foreground="#666").pack(side="left", padx=6)
+
+        tbl = ttk.Frame(detail); tbl.pack(fill="x", padx=6, pady=(0, 3))
+        cols = ("tag", "mode", "values")
+        self.tv_filter = ttk.Treeview(tbl, columns=cols, show="headings", height=4)
+        for cid, text, w in (("tag", "DICOM 标签", 280), ("mode", "匹配模式", 110),
+                             ("values", "命中值（多个值任一命中即可）", 330)):
+            self.tv_filter.heading(cid, text=text)
+            self.tv_filter.column(cid, width=w, anchor="w", stretch=(cid == "values"))
+        sb = ttk.Scrollbar(tbl, orient="vertical", command=self.tv_filter.yview)
+        self.tv_filter.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        self.tv_filter.pack(side="left", fill="x", expand=True)
+        self.tv_filter.bind("<Double-1>", lambda e: self._edit_filter_rule())
+
+        bar = ttk.Frame(detail); bar.pack(fill="x", padx=6, pady=(0, 6))
+        self.btn_filter_add = ttk.Button(bar, text="添加规则", command=self._add_filter_rule)
+        self.btn_filter_add.pack(side="left")
+        self.btn_filter_edit = ttk.Button(bar, text="编辑", command=self._edit_filter_rule)
+        self.btn_filter_edit.pack(side="left", padx=4)
+        self.btn_filter_del = ttk.Button(bar, text="删除", command=self._del_filter_rule)
+        self.btn_filter_del.pack(side="left")
+        self.btn_filter_reset = ttk.Button(bar, text="恢复默认规则", command=self._reset_filter_rules)
+        self.btn_filter_reset.pack(side="left", padx=4)
+        ttk.Label(bar, text="（双击行可编辑）", foreground="#666").pack(side="left", padx=8)
+        self._filter_buttons = [self.btn_filter_add, self.btn_filter_edit,
+                                self.btn_filter_del, self.btn_filter_reset]
+        self._toggle_filter_detail()
+
+    def _toggle_filter_detail(self):
+        """勾选「启用剂量报告/截屏过滤」才展开详细规则配置。"""
+        if self.var_filter.get():
+            self.filter_detail.pack(fill="x")
+        else:
+            self.filter_detail.pack_forget()
 
     def _entry_pair(self, parent, label, attr, default=""):
         r = ttk.Frame(parent); r.pack(fill="x", padx=6, pady=3)
@@ -1342,6 +2074,316 @@ class App:
                 yield from walk(ch)
 
         yield from walk(self.root)
+
+    # ----- 配置区滚动 -----
+    def _bind_wheel(self, _event=None):
+        self._cfg_canvas.bind_all("<MouseWheel>", self._on_wheel)
+        self._cfg_canvas.bind_all("<Button-4>", self._on_wheel)
+        self._cfg_canvas.bind_all("<Button-5>", self._on_wheel)
+
+    def _unbind_wheel(self, _event=None):
+        self._cfg_canvas.unbind_all("<MouseWheel>")
+        self._cfg_canvas.unbind_all("<Button-4>")
+        self._cfg_canvas.unbind_all("<Button-5>")
+
+    def _on_wheel(self, event):
+        """滚轮滚动配置区：兼容 Windows/macOS（delta）与 X11（Button-4/5）。"""
+        try:
+            if getattr(event, "num", None) == 4:
+                step = -1
+            elif getattr(event, "num", None) == 5:
+                step = 1
+            else:
+                d = getattr(event, "delta", 0)
+                if abs(d) >= 120:
+                    step = int(-d / 120) or (-1 if d > 0 else 1)
+                else:
+                    step = -1 if d > 0 else 1
+            self._cfg_canvas.yview_scroll(step, "units")
+        except Exception:
+            pass
+
+    # ----- 规则表：渲染 -----
+    def _rebuild_desens_table(self):
+        tv = self.tv_desens
+        tv.delete(*tv.get_children())
+        for i, r in enumerate(self.desens_rules):
+            tv.insert("", "end", iid=str(i), values=(
+                tag_display(r.get("tag", "")),
+                _DESENS_METHOD_LABEL.get(r.get("method"), r.get("method", "")),
+                r.get("param", ""),
+                "顶层 + 序列内" if r.get("recursive") else "仅顶层",
+            ))
+
+    def _rebuild_filter_table(self):
+        tv = self.tv_filter
+        tv.delete(*tv.get_children())
+        for i, r in enumerate(self.filter_rules):
+            vals = r.get("values") or []
+            if isinstance(vals, str):
+                vals = [vals]
+            tv.insert("", "end", iid=str(i), values=(
+                tag_display(r.get("tag", "")),
+                _FILTER_MODE_LABEL.get(r.get("mode"), r.get("mode", "")),
+                " ； ".join(str(v) for v in vals),
+            ))
+
+    @staticmethod
+    def _selected_index(tv):
+        sel = tv.selection()
+        if not sel:
+            return None
+        try:
+            return int(sel[0])
+        except Exception:
+            return None
+
+    @staticmethod
+    def _select_row(tv, idx):
+        try:
+            iid = str(idx)
+            tv.selection_set(iid)
+            tv.see(iid)
+        except Exception:
+            pass
+
+    # ----- 规则表：增删改（模块①）-----
+    def _add_desens_rule(self):
+        r = self._desens_dialog()
+        if not r:
+            return
+        # 同一标签只保留一条：新加的覆盖旧的
+        self.desens_rules = [x for x in self.desens_rules if x.get("tag") != r["tag"]]
+        self.desens_rules.append(r)
+        self._rebuild_desens_table()
+        self._select_row(self.tv_desens, len(self.desens_rules) - 1)
+
+    def _edit_desens_rule(self):
+        i = self._selected_index(self.tv_desens)
+        if i is None or not (0 <= i < len(self.desens_rules)):
+            messagebox.showinfo("提示", "请先在表格中选择一条规则", parent=self.root)
+            return
+        r = self._desens_dialog(self.desens_rules[i])
+        if not r:
+            return
+        new_list = []
+        for n, x in enumerate(self.desens_rules):
+            if n != i and x.get("tag") == r["tag"]:
+                continue          # 与其它规则标签冲突：丢弃冲突的那条
+            new_list.append(r if n == i else x)
+        self.desens_rules = new_list
+        self._rebuild_desens_table()
+        self._select_row(self.tv_desens, new_list.index(r))
+
+    def _del_desens_rule(self):
+        i = self._selected_index(self.tv_desens)
+        if i is None or not (0 <= i < len(self.desens_rules)):
+            messagebox.showinfo("提示", "请先在表格中选择一条规则", parent=self.root)
+            return
+        if not messagebox.askyesno("确认删除", "确定删除规则：%s ？" % tag_display(self.desens_rules[i].get("tag", "")),
+                                   parent=self.root):
+            return
+        del self.desens_rules[i]
+        self._rebuild_desens_table()
+
+    def _reset_desens_rules(self):
+        if not messagebox.askyesno("恢复默认规则", "将丢弃当前规则表并恢复为默认规则，确定？", parent=self.root):
+            return
+        self.desens_rules = [dict(r) for r in _DEFAULT_DESENS_RULES]
+        self._rebuild_desens_table()
+
+    def _desens_dialog(self, rule=None):
+        """新增/编辑一条标签脱敏规则。确定返回规则 dict，取消返回 None。"""
+        rule = dict(rule or {})
+        dlg = tk.Toplevel(self.root)
+        dlg.title("标签脱敏规则")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        body = ttk.Frame(dlg); body.pack(fill="both", expand=True, padx=14, pady=12)
+
+        r1 = ttk.Frame(body); r1.pack(fill="x", pady=3)
+        ttk.Label(r1, text="DICOM 标签:", width=12, anchor="w").pack(side="left")
+        var_tag = tk.StringVar(value=str(rule.get("tag", "")))
+        ttk.Combobox(r1, textvariable=var_tag, width=44,
+                     values=_COMMON_TAGS).pack(side="left", padx=4)
+        ttk.Label(body, text="可从下拉选择常用标签；也可手输关键字（PatientName）或 Tag 号（0010,0020）",
+                  foreground="#666").pack(anchor="w", padx=(96, 0))
+
+        r2 = ttk.Frame(body); r2.pack(fill="x", pady=3)
+        ttk.Label(r2, text="脱敏方法:", width=12, anchor="w").pack(side="left")
+        var_method = tk.StringVar(
+            value=_DESENS_METHOD_LABEL.get(rule.get("method", "hash"), _DESENS_METHOD_LABEL["hash"]))
+        ttk.Combobox(r2, textvariable=var_method, state="readonly", width=30,
+                     values=[lab for _k, lab, _h in _DESENS_METHODS]).pack(side="left", padx=4)
+
+        r3 = ttk.Frame(body); r3.pack(fill="x", pady=3)
+        ttk.Label(r3, text="参数:", width=12, anchor="w").pack(side="left")
+        var_param = tk.StringVar(value=str(rule.get("param", "") or ""))
+        ent_param = ttk.Entry(r3, textvariable=var_param, width=30)
+        ent_param.pack(side="left", padx=4)
+        lbl_hint = ttk.Label(body, text="", foreground="#666")
+        lbl_hint.pack(anchor="w", padx=(96, 0))
+
+        r4 = ttk.Frame(body); r4.pack(fill="x", pady=3)
+        ttk.Label(r4, text="作用范围:", width=12, anchor="w").pack(side="left")
+        var_rec = tk.BooleanVar(value=bool(rule.get("recursive")))
+        ttk.Checkbutton(r4, text="同时作用于序列（SQ）内的同名标签", variable=var_rec).pack(side="left")
+
+        def _method_key():
+            lab = var_method.get()
+            for k, v, _h in _DESENS_METHODS:
+                if v == lab:
+                    return k
+            return "hash"
+
+        def _sync_param(*_a):
+            key = _method_key()
+            lbl_hint.config(text=_DESENS_METHOD_HINT.get(key, ""))
+            ent_param.config(state="normal" if key in _DESENS_PARAM_METHODS else "disabled")
+
+        var_method.trace_add("write", lambda *a: _sync_param())
+        _sync_param()
+
+        btns = ttk.Frame(body); btns.pack(fill="x", pady=(12, 0))
+
+        def _ok():
+            try:
+                tag = parse_tag(var_tag.get())
+            except ValueError as e:
+                messagebox.showwarning("标签有误", str(e), parent=dlg)
+                return
+            method = _method_key()
+            param = var_param.get().strip() if method in _DESENS_PARAM_METHODS else ""
+            if method == "hash":
+                try:
+                    n = int(param or 16)
+                except ValueError:
+                    messagebox.showwarning("参数有误", "哈希截断位数必须是整数（默认 16）", parent=dlg)
+                    return
+                if not (1 <= n <= 128):
+                    messagebox.showwarning("参数有误", "哈希截断位数需在 1~128 之间", parent=dlg)
+                    return
+                param = str(n)
+            result["value"] = {"tag": tag_to_str(tag), "method": method,
+                               "param": param, "recursive": bool(var_rec.get())}
+            dlg.destroy()
+
+        ttk.Button(btns, text="确定", command=_ok).pack(side="right", padx=4)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        _center_on_parent(dlg, self.root)
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result["value"]
+
+    # ----- 规则表：增删改（模块②）-----
+    def _add_filter_rule(self):
+        r = self._filter_dialog()
+        if r:
+            self.filter_rules.append(r)
+            self._rebuild_filter_table()
+            self._select_row(self.tv_filter, len(self.filter_rules) - 1)
+
+    def _edit_filter_rule(self):
+        i = self._selected_index(self.tv_filter)
+        if i is None or not (0 <= i < len(self.filter_rules)):
+            messagebox.showinfo("提示", "请先在表格中选择一条规则", parent=self.root)
+            return
+        r = self._filter_dialog(self.filter_rules[i])
+        if not r:
+            return
+        self.filter_rules[i] = r
+        self._rebuild_filter_table()
+        self._select_row(self.tv_filter, i)
+
+    def _del_filter_rule(self):
+        i = self._selected_index(self.tv_filter)
+        if i is None or not (0 <= i < len(self.filter_rules)):
+            messagebox.showinfo("提示", "请先在表格中选择一条规则", parent=self.root)
+            return
+        if not messagebox.askyesno("确认删除", "确定删除规则：%s ？" % tag_display(self.filter_rules[i].get("tag", "")),
+                                   parent=self.root):
+            return
+        del self.filter_rules[i]
+        self._rebuild_filter_table()
+
+    def _reset_filter_rules(self):
+        if not messagebox.askyesno("恢复默认规则", "将丢弃当前规则表并恢复为默认规则，确定？", parent=self.root):
+            return
+        self.filter_rules = [dict(r) for r in _DEFAULT_FILTER_RULES]
+        self._rebuild_filter_table()
+
+    def _filter_dialog(self, rule=None):
+        """新增/编辑一条过滤规则。确定返回规则 dict，取消返回 None。"""
+        rule = dict(rule or {})
+        dlg = tk.Toplevel(self.root)
+        dlg.title("剂量报告/截屏过滤规则")
+        dlg.transient(self.root)
+        dlg.resizable(False, False)
+        result = {"value": None}
+
+        body = ttk.Frame(dlg); body.pack(fill="both", expand=True, padx=14, pady=12)
+
+        r1 = ttk.Frame(body); r1.pack(fill="x", pady=3)
+        ttk.Label(r1, text="DICOM 标签:", width=12, anchor="w").pack(side="left")
+        var_tag = tk.StringVar(value=str(rule.get("tag", "")))
+        ttk.Combobox(r1, textvariable=var_tag, width=44,
+                     values=_COMMON_TAGS).pack(side="left", padx=4)
+        ttk.Label(body, text="可从下拉选择常用标签；也可手输关键字（ImageType）或 Tag 号（0008,0008）",
+                  foreground="#666").pack(anchor="w", padx=(96, 0))
+
+        r2 = ttk.Frame(body); r2.pack(fill="x", pady=3)
+        ttk.Label(r2, text="匹配模式:", width=12, anchor="w").pack(side="left")
+        var_mode = tk.StringVar(
+            value=_FILTER_MODE_LABEL.get(rule.get("mode", "exact"), _FILTER_MODE_LABEL["exact"]))
+        ttk.Combobox(r2, textvariable=var_mode, state="readonly", width=30,
+                     values=[lab for _k, lab in _FILTER_MODES]).pack(side="left", padx=4)
+
+        r3 = ttk.Frame(body); r3.pack(fill="x", pady=3)
+        ttk.Label(r3, text="命中值:", width=12, anchor="w").pack(side="left")
+        cur_vals = rule.get("values") or []
+        if isinstance(cur_vals, str):
+            cur_vals = [cur_vals]
+        var_vals = tk.StringVar(value=";".join(str(v) for v in cur_vals))
+        ttk.Entry(r3, textvariable=var_vals, width=44).pack(side="left", padx=4)
+        ttk.Label(body, text="多个值用「;」分隔，任一命中即算命中；匹配不区分大小写；"
+                             "多值字段（如 ImageType）会按「\\」切分后逐段比对",
+                  foreground="#666").pack(anchor="w", padx=(96, 0))
+
+        btns = ttk.Frame(body); btns.pack(fill="x", pady=(12, 0))
+
+        def _mode_key():
+            lab = var_mode.get()
+            for k, v in _FILTER_MODES:
+                if v == lab:
+                    return k
+            return "exact"
+
+        def _ok():
+            try:
+                tag = parse_tag(var_tag.get())
+            except ValueError as e:
+                messagebox.showwarning("标签有误", str(e), parent=dlg)
+                return
+            mode = _mode_key()
+            vals = [v.strip() for v in re.split(r"[;\n]", var_vals.get()) if v.strip()]
+            if not vals:
+                messagebox.showwarning("命中值有误", "请至少填写一个命中值", parent=dlg)
+                return
+            result["value"] = {"tag": tag_to_str(tag), "mode": mode, "values": vals}
+            dlg.destroy()
+
+        ttk.Button(btns, text="确定", command=_ok).pack(side="right", padx=4)
+        ttk.Button(btns, text="取消", command=dlg.destroy).pack(side="right")
+        dlg.bind("<Return>", lambda e: _ok())
+        dlg.bind("<Escape>", lambda e: dlg.destroy())
+        _center_on_parent(dlg, self.root)
+        dlg.grab_set()
+        self.root.wait_window(dlg)
+        return result["value"]
 
     # ----- 事件 -----
     def _browse_excel(self):
@@ -1395,6 +2437,14 @@ class App:
             c.cfind_timeout = int(self.var_cfind_timeout.get().strip() or 60)
         except ValueError:
             c.cfind_timeout = 60
+        c.desens_enabled = bool(self.var_desens.get())
+        c.desens_rules = [dict(r) for r in self.desens_rules]
+        c.desens_purge_private = bool(self.var_purge_private.get())
+        c.desens_date_month = bool(self.var_date_month.get())
+        c.desens_time_clear = bool(self.var_time_clear.get())
+        c.filter_enabled = bool(self.var_filter.get())
+        c.filter_rules = [dict(r) for r in self.filter_rules]
+        c.filter_save_hit = bool(self.var_filter_save_hit.get())
         return c
 
     def _test_connectivity(self):
@@ -1473,6 +2523,11 @@ class App:
         self.btn_start.config(state="disabled")
         self.btn_stop.config(state="normal")
         self.btn_history.config(state="disabled")
+        for b in self._desens_buttons + self._filter_buttons:
+            try:
+                b.config(state="disabled")
+            except Exception:
+                pass
         self.var_status.set("下载中...")
         self.var_image_count.set("影像数: 0 / ?")
         self.var_elapsed.set("已耗时: 00:00:00")
@@ -1526,7 +2581,26 @@ class App:
             self.var_pause_seconds.set(str(getattr(self.cfg, "pause_seconds", 30)))
             self.var_cmove_timeout.set(str(getattr(self.cfg, "cmove_timeout", 300)))
             self.var_cfind_timeout.set(str(getattr(self.cfg, "cfind_timeout", 60)))
-            self._append_log("已自动加载配置：%s" % CONFIG_PATH)
+            self.var_desens.set(bool(getattr(self.cfg, "desens_enabled", False)))
+            self.var_filter.set(bool(getattr(self.cfg, "filter_enabled", False)))
+            self.var_purge_private.set(bool(getattr(self.cfg, "desens_purge_private", True)))
+            self.var_date_month.set(bool(getattr(self.cfg, "desens_date_month", True)))
+            self.var_time_clear.set(bool(getattr(self.cfg, "desens_time_clear", True)))
+            self.var_filter_save_hit.set(bool(getattr(self.cfg, "filter_save_hit", True)))
+            # 按加载后的开关状态同步展开/收起详细配置
+            self._toggle_desens_detail()
+            self._toggle_filter_detail()
+            # 规则表：配置里没有（旧版 config.json）时保留界面上的默认规则
+            dr = getattr(self.cfg, "desens_rules", None)
+            if isinstance(dr, list) and dr:
+                self.desens_rules = [dict(r) for r in dr if isinstance(r, dict)]
+                self._rebuild_desens_table()
+            fr = getattr(self.cfg, "filter_rules", None)
+            if isinstance(fr, list) and fr:
+                self.filter_rules = [dict(r) for r in fr if isinstance(r, dict)]
+                self._rebuild_filter_table()
+            self._append_log("已自动加载配置：%s（脱敏规则 %d 条，过滤规则 %d 条）" % (
+                CONFIG_PATH, len(self.desens_rules), len(self.filter_rules)))
         except Exception as e:
             print("load config error:", e)
 
@@ -1562,6 +2636,11 @@ class App:
         self.btn_test.config(state="normal")
         self.btn_start.config(state="normal")
         self.btn_stop.config(state="disabled")
+        for b in self._desens_buttons + self._filter_buttons:
+            try:
+                b.config(state="normal")
+            except Exception:
+                pass
         if status_text:
             self.var_status.set(status_text)
 
