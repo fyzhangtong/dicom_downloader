@@ -1833,17 +1833,19 @@ def _batch_download_inner(cfg):
     global _desens_enabled, _desens_rules, _desens_opts
     global _filter_enabled, _filter_rules, _filter_save_hit
     global _desens_audit_rows, _desens_audit_csv, _desens_audit_header
+    global _desens_audit_fields
     # 关键：重置停止标志，避免上一次“停止”被传染到本次下载
     _stop_event.clear()
     _clear_records()
     with _store_lock:
         _store_failed.clear()
         _store_failed_files.clear()   # 失败明细按本次下载重新累积
-    # 脱敏审计按本次下载重新累积（临时 CSV 与表头状态一并复位）
+    # 脱敏审计按本次下载重新累积（临时 CSV、表头状态与字段列一并复位）
     with _desens_audit_lock:
         _desens_audit_rows = []
         _desens_audit_header = False
         _desens_audit_csv = ""
+        _desens_audit_fields = []
 
     OUTPUT_ROOT = cfg.out_dir
     _download_start_time = time.time()  # 记录本次下载开始时间
@@ -1877,8 +1879,11 @@ def _batch_download_inner(cfg):
         if not _desens_rules:
             _ui_queue.put(("log", "[脱敏] 未配置任何标签规则，仅按全局选项处理"))
         # 脱敏审计：开启模块①即自动生成（明细先落临时 CSV，下载结束转成 Excel）
+        # 「一个影像一行、每个配置规则字段各占一列」——字段列须在此按本次规则初始化，
+        # 否则审计表只剩固定列，所有变更会全部挤进「其它变更」列。
         with _desens_audit_lock:
             _desens_audit_csv = os.path.join(cfg.out_dir, "_脱敏审计明细.tmp.csv")
+            _desens_audit_fields = [tag_to_str(r["tag"]) for r in _desens_rules]
         _ui_queue.put(("log", "[审计] 已开启脱敏审计：本次将逐字段记录脱敏前后对比，结束时生成 Excel"))
     if _filter_enabled:
         if _filter_save_hit:
